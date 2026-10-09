@@ -26,6 +26,8 @@ pub struct CampaignRecord {
     invite_code: Option<String>,
     owner_user_id: String,
     role: CampaignRole,
+    /// A game session is running right now.
+    live: bool,
     created_at: String,
 }
 
@@ -96,6 +98,7 @@ impl CampaignRow {
                 CampaignRole::Player
             },
             owner_user_id: self.owner_user_id,
+            live: false,
             created_at: self.created_at,
         }
     }
@@ -159,9 +162,18 @@ async fn list_campaigns(
     .fetch_all(&state.pool)
     .await?;
 
+    let live_ids = sqlx::query_scalar::<_, String>(
+        "SELECT campaign_id FROM table_states WHERE json_extract(payload, '$.sessionId') IS NOT NULL",
+    )
+    .fetch_all(&state.pool)
+    .await?;
     let campaigns = campaign_rows
         .into_iter()
-        .map(|row| row.into_record(&user.id))
+        .map(|row| {
+            let mut record = row.into_record(&user.id);
+            record.live = live_ids.contains(&record.id);
+            record
+        })
         .collect();
     Ok(Json(CampaignSyncResponse { campaigns, members }))
 }

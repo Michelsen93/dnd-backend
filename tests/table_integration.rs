@@ -429,6 +429,8 @@ async fn sessions_entities_and_loot() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(t.snapshot(&t.player).await["session"]["number"], 1);
+    let list = t.app.ok("GET", "/api/campaigns", &t.player, None).await;
+    assert_eq!(list["campaigns"][0]["live"], true);
 
     let hidden_quest = t
         .app
