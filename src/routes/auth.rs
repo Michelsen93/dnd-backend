@@ -1,8 +1,16 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use axum_extra::extract::PrivateCookieJar;
 
 use crate::{
-    auth::{add_session_cookie, clear_session_cookie, hash_password, require_user, verify_password},
+    auth::{
+        add_session_cookie, clear_session_cookie, hash_password, require_user, verify_password,
+    },
     db::UserRow,
     error::ApiError,
     models::{AuthResponse, Credentials, MessageResponse, UserResponse},
@@ -24,7 +32,9 @@ pub async fn register(
 ) -> Result<impl IntoResponse, ApiError> {
     let email = input.email.trim().to_lowercase();
     if email.is_empty() || input.password.len() < 8 {
-        return Err(ApiError::bad_request("Email is required and password must be at least 8 characters"));
+        return Err(ApiError::bad_request(
+            "Email is required and password must be at least 8 characters",
+        ));
     }
 
     let existing = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE email = ?")
@@ -32,7 +42,9 @@ pub async fn register(
         .fetch_optional(&state.pool)
         .await?;
     if existing.is_some() {
-        return Err(ApiError::bad_request("An account with this email already exists"));
+        return Err(ApiError::bad_request(
+            "An account with this email already exists",
+        ));
     }
 
     let now = crate::models::now_iso();
@@ -59,7 +71,10 @@ pub async fn register(
 
     Ok((
         StatusCode::CREATED,
-        (add_session_cookie(jar, &user_id), Json(AuthResponse { user })),
+        (
+            add_session_cookie(jar, &user_id),
+            Json(AuthResponse { user }),
+        ),
     ))
 }
 

@@ -1,25 +1,45 @@
-use axum::{routing::get, Json, Router};
+use axum::{Json, Router, routing::get};
 
 use crate::{models::HealthResponse, state::AppState};
 
 pub mod auth;
 pub mod campaigns;
 pub mod characters;
-pub mod combat;
 pub mod encounters;
+pub mod entities;
 pub mod notes;
+pub mod sessions;
+pub mod table;
 
 pub fn router() -> Router<AppState> {
+    let campaigns = campaigns::router()
+        .merge(encounters::router())
+        .merge(entities::router())
+        .merge(sessions::router())
+        .merge(table::router());
+
     Router::new()
         .route("/health", get(health))
         .nest("/api/auth", auth::router())
-        .route("/api/characters", get(characters::list).post(characters::create))
-        .route("/api/characters/{id}", get(characters::get_one).patch(characters::update).delete(characters::delete_character))
-        .route("/api/characters/{id}/notes", get(notes::list_for_character).post(notes::create_for_character))
-        .route("/api/notes/{id}", axum::routing::patch(notes::update).delete(notes::delete_note))
-        .nest("/api/combat", combat::router())
-        .nest("/api/encounters", encounters::router())
-        .nest("/api/campaigns", campaigns::router())
+        .route(
+            "/api/characters",
+            get(characters::list).post(characters::create),
+        )
+        .route(
+            "/api/characters/{id}",
+            get(characters::get_one)
+                .patch(characters::update)
+                .delete(characters::delete_character),
+        )
+        .route(
+            "/api/characters/{id}/notes",
+            get(notes::list_for_character).post(notes::create_for_character),
+        )
+        .route(
+            "/api/notes/{id}",
+            axum::routing::patch(notes::update).delete(notes::delete_note),
+        )
+        .nest("/api/campaigns", campaigns)
 }
 
 async fn health() -> Json<HealthResponse> {

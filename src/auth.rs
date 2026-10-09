@@ -1,9 +1,9 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
-use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::PrivateCookieJar;
+use axum_extra::extract::cookie::{Cookie, SameSite};
 use sqlx::SqlitePool;
 
 use crate::db::UserRow;

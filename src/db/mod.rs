@@ -1,9 +1,14 @@
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
+use std::str::FromStr;
+
+use sqlx::{
+    FromRow, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 
 use crate::error::ApiError;
-use crate::models::{Character, CombatEntry};
+use crate::models::Character;
 
 #[derive(Clone, Debug, FromRow)]
 pub struct UserRow {
@@ -19,38 +24,23 @@ pub struct PayloadRow {
     pub payload: String,
 }
 
-#[derive(Clone, Debug, FromRow)]
-pub struct CombatSessionRow {
-    pub id: String,
-    pub user_id: String,
-    pub name: Option<String>,
-    pub round: i32,
-    pub active_index: i32,
-    pub started: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct CombatEntryRow {
-    pub session_id: String,
-    pub payload: String,
-}
-
 pub async fn connect(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await?;
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal);
 
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(&pool)
-        .await?;
-    sqlx::query("PRAGMA journal_mode = WAL;")
-        .execute(&pool)
-        .await?;
+    // Every `:memory:` connection is its own database, so in-memory pools must be single-connection.
+    let max_connections = if database_url.contains(":memory:") {
+        1
+    } else {
+        5
+    };
 
-    Ok(pool)
+    SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(options)
+        .await
 }
 
 pub fn serialize_payload<T: Serialize>(value: &T) -> Result<String, ApiError> {
@@ -73,7 +63,11 @@ where
 
     let base_object = match &mut base {
         Value::Object(object) => object,
-        _ => return Err(ApiError::bad_request("Target payload must be a JSON object")),
+        _ => {
+            return Err(ApiError::bad_request(
+                "Target payload must be a JSON object",
+            ));
+        }
     };
 
     merge_objects(base_object, patch_object);
@@ -87,9 +81,5 @@ fn merge_objects(base: &mut Map<String, Value>, patch: Map<String, Value>) {
 }
 
 pub fn character_from_row(row: &PayloadRow) -> Result<Character, ApiError> {
-    deserialize_payload(&row.payload)
-}
-
-pub fn combat_entry_from_row(row: &CombatEntryRow) -> Result<CombatEntry, ApiError> {
     deserialize_payload(&row.payload)
 }

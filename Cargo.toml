@@ -11,6 +11,7 @@ chrono = { version = "0.4.42", features = ["serde", "clock"] }
 dotenvy = "0.15.7"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+rand = "0.8.5"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }

@@ -1,16 +1,18 @@
 use axum::{
-    body::Body,
-    http::{header, Request, StatusCode},
     Router,
+    body::Body,
+    http::{Request, StatusCode, header},
 };
 use axum_extra::extract::cookie::Key;
 use backend::{db, routes, state::AppState};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 async fn test_app() -> Router {
-    let pool = db::connect("sqlite::memory:").await.expect("connect sqlite");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("connect sqlite");
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -20,20 +22,17 @@ async fn test_app() -> Router {
     let seed = b"campaign-integration-tests-key-seed";
     bytes[..seed.len()].copy_from_slice(seed);
 
-    let (encounter_sync_tx, _encounter_sync_rx) = tokio::sync::broadcast::channel::<String>(16);
-
-    let state = AppState {
+    let state = AppState::new(
         pool,
-        cookie_key: Key::from(&bytes),
-        config: backend::config::AppConfig {
+        Key::from(&bytes),
+        backend::config::AppConfig {
             app_host: "127.0.0.1".to_string(),
             app_port: 3001,
             database_url: "sqlite::memory:".to_string(),
             allowed_origin: "http://localhost:5173".to_string(),
             cookie_secret: "campaign-integration-tests-key-seed".to_string(),
         },
-        encounter_sync_tx,
-    };
+    );
 
     routes::router().with_state(state)
 }
@@ -394,7 +393,9 @@ async fn add_member_is_idempotent_for_same_character() {
                 .uri("/api/campaigns")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, &owner_cookie)
-                .body(Body::from(json!({ "name": "Idempotency Check" }).to_string()))
+                .body(Body::from(
+                    json!({ "name": "Idempotency Check" }).to_string(),
+                ))
                 .expect("build create-campaign request"),
         )
         .await
@@ -468,7 +469,8 @@ async fn add_member_is_idempotent_for_same_character() {
         .iter()
         .filter(|member| {
             member.get("campaignId").and_then(Value::as_str) == Some(campaign_id.as_str())
-                && member.get("characterId").and_then(Value::as_str) == Some(owner_character_id.as_str())
+                && member.get("characterId").and_then(Value::as_str)
+                    == Some(owner_character_id.as_str())
         })
         .count();
 
@@ -495,7 +497,9 @@ async fn non_owner_cannot_regenerate_invite_or_remove_members() {
                 .uri("/api/campaigns")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, &owner_cookie)
-                .body(Body::from(json!({ "name": "Private Campaign" }).to_string()))
+                .body(Body::from(
+                    json!({ "name": "Private Campaign" }).to_string(),
+                ))
                 .expect("build create-campaign request"),
         )
         .await

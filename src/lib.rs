@@ -1,7 +1,11 @@
+pub mod access;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod dice;
 pub mod error;
 pub mod models;
+pub mod projection;
+pub mod repo;
 pub mod routes;
 pub mod state;

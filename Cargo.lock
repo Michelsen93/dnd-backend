@@ -197,6 +197,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "http-body-util",
+ "rand",
  "serde",
  "serde_json",
  "sqlx",

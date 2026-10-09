@@ -1,10 +1,14 @@
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use axum_extra::extract::PrivateCookieJar;
 use serde_json::Value;
 
 use crate::{
     auth::require_user,
-    db::{character_from_row, deserialize_payload, merge_json, serialize_payload, PayloadRow},
+    db::{PayloadRow, character_from_row, deserialize_payload, merge_json, serialize_payload},
     error::ApiError,
     models::{Character, NewCharacter},
     state::AppState,
@@ -101,6 +105,16 @@ pub async fn update(
         .execute(&state.pool)
         .await?;
 
+    sqlx::query(
+        "UPDATE campaign_members SET character_name = ?, sprite_key = ? WHERE character_id = ?",
+    )
+    .bind(&updated.name)
+    .bind(&updated.sprite_key)
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+    crate::repo::notify_character_campaigns(&state, &id).await?;
+
     Ok(Json(updated))
 }
 
@@ -110,6 +124,7 @@ pub async fn delete_character(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    crate::repo::notify_character_campaigns(&state, &id).await?;
     let result = sqlx::query("DELETE FROM characters WHERE id = ? AND user_id = ?")
         .bind(&id)
         .bind(&user.id)
