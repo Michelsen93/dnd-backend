@@ -414,7 +414,9 @@ fn sort_initiative(combat: &mut Combat) {
             .unwrap_or(i32::MIN)
             .cmp(&a.initiative.unwrap_or(i32::MIN))
     });
-    if let Some(current) = current {
+    if combat.turns_taken == 0 {
+        combat.turn_index = 0;
+    } else if let Some(current) = current {
         combat.turn_index = combat
             .combatants
             .iter()
@@ -785,6 +787,7 @@ impl Ctx<'_> {
             round: 1,
             turn_index: 0,
             combatants,
+            turns_taken: 0,
         };
         sort_initiative(&mut combat);
         combat.turn_index = 0;
@@ -817,6 +820,7 @@ impl Ctx<'_> {
                     .is_none_or(|m| m.hit_points_current <= 0)
         };
 
+        combat.turns_taken += 1;
         for _ in 0..combat.combatants.len() {
             combat.turn_index += 1;
             if combat.turn_index >= combat.combatants.len() {
@@ -830,9 +834,13 @@ impl Ctx<'_> {
         let current = combat.combatants[combat.turn_index].clone();
         let round = combat.round;
         self.save_table(&table).await?;
+        let visibility = match (&encounter, current.kind.as_str()) {
+            (Some(encounter), "monster") => monster_event_visibility(encounter, &current.ref_id),
+            _ => "public",
+        };
         self.event(
             "turn",
-            "public",
+            visibility,
             json!({ "text": format!("Round {round}: {}'s turn", current.name), "combatantId": current.id, "round": round }),
         )
         .await
@@ -951,10 +959,11 @@ impl Ctx<'_> {
                     projection::health_status(monster.hit_points_current, monster.hit_points_max);
                 let (hp, max) = (monster.hit_points_current, monster.hit_points_max);
                 repo::save_encounter(&self.state.pool, &mut encounter).await?;
+                let visibility = monster_event_visibility(&encounter, target_id);
                 let suffix = if amount >= 0 { " damage" } else { " HP" };
                 self.event(
                     "damage",
-                    "public",
+                    visibility,
                     json!({ "text": format!("{name} {verb} {shown}{suffix} ({status})"), "targetId": target_id, "dmDetail": format!("{hp}/{max}") }),
                 )
                 .await
@@ -1004,7 +1013,7 @@ impl Ctx<'_> {
                 true
             }
         };
-        let (name, added) = match target_kind {
+        let (name, added, visibility) = match target_kind {
             "monster" => {
                 let table = self.table().await?;
                 let mut encounter = self.active_encounter(&table).await?;
@@ -1016,7 +1025,8 @@ impl Ctx<'_> {
                 let added = toggle(&mut monster.conditions);
                 let name = monster.name.clone();
                 repo::save_encounter(&self.state.pool, &mut encounter).await?;
-                (name, added)
+                let visibility = monster_event_visibility(&encounter, target_id);
+                (name, added, visibility)
             }
             "pc" => {
                 self.require_member_character(target_id).await?;
@@ -1031,7 +1041,7 @@ impl Ctx<'_> {
                     .unwrap_or("?")
                     .to_string();
                 repo::save_character_value(self.state, target_id, &mut record.value).await?;
-                (name, added)
+                (name, added, "public")
             }
             _ => {
                 return Err(ApiError::bad_request(
@@ -1044,7 +1054,7 @@ impl Ctx<'_> {
         } else {
             format!("{name} is no longer {condition}")
         };
-        self.event("condition", "public", json!({ "text": text }))
+        self.event("condition", visibility, json!({ "text": text }))
             .await
     }
 
@@ -1144,6 +1154,16 @@ impl Ctx<'_> {
             Err(ApiError::not_found("Character not found"))
         }
     }
+}
+
+/// Events about a monster the players cannot see must stay behind the DM screen.
+fn monster_event_visibility(encounter: &Encounter, monster_id: &str) -> &'static str {
+    let visibility = projection::player_visibility(encounter);
+    let seen = encounter
+        .monsters
+        .iter()
+        .any(|m| m.id == monster_id && projection::is_visible(&visibility, m.x, m.y));
+    if seen { "public" } else { "dm" }
 }
 
 fn string_list(value: &Value, key: &str) -> Vec<String> {

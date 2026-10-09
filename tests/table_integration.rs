@@ -208,6 +208,27 @@ async fn combat_turns_initiative_movement_and_damage() {
     assert_eq!(combatants.len(), 3);
     let pip = combatants.iter().find(|c| c["kind"] == "pc").unwrap();
     assert_eq!(pip["initiative"].as_i64().unwrap(), total);
+    assert_eq!(
+        dm_view["table"]["combat"]["turnIndex"], 0,
+        "before anyone acts, the turn stays at the top of the order"
+    );
+
+    // The hidden orc's turn and wounds are announced to the DM only.
+    t.action(
+        &t.dm,
+        json!({ "type": "apply_damage", "targetKind": "monster", "targetId": "orc", "amount": 1 }),
+    )
+    .await;
+    let player_feed = t.snapshot(&t.player).await["events"].to_string();
+    assert!(
+        !player_feed.contains("Orc"),
+        "hidden monsters never appear in the player feed"
+    );
+    assert!(
+        t.snapshot(&t.dm).await["events"]
+            .to_string()
+            .contains("Orc takes 1")
+    );
 
     // Players don't see the hidden orc in the initiative order.
     let player_view = t.snapshot(&t.player).await;

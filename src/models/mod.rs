@@ -413,6 +413,10 @@ pub struct Combat {
     pub round: i32,
     pub turn_index: usize,
     pub combatants: Vec<Combatant>,
+    /// Number of turns advanced so far. While 0, late initiative rolls re-sort and the
+    /// turn stays at the top of the order (nobody has acted yet).
+    #[serde(default)]
+    pub turns_taken: i32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
