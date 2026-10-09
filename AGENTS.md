@@ -4,108 +4,113 @@ Guidance for AI coding agents working in this repo. `CLAUDE.md` imports this fil
 
 ## What this is
 
-The Rust API for Pixel Quest, a D&D 5e campaign companion. The React frontend lives in the
-sibling repo `michelsen93/dnd` (checked out at `../dnd`), whose `AGENTS.md` describes the product
-and whose **`docs/GAMEPLAY.md` holds the gameplay design and roadmap** — read it before feature
-work.
+The Rust API for Pixel Quest, a D&D 5e campaign app. It owns accounts, characters, campaigns and
+**the live table**: per-campaign maps, initiative, server-side dice, the event feed, sessions, and
+the projection that decides what each player is allowed to see. The React frontend lives in the
+sibling repo `michelsen93/dnd` (checked out at `../dnd`); its `AGENTS.md` describes the product and
+its **`docs/GAMEPLAY.md` holds the gameplay design, the endpoint table, and the roadmap**.
 
 Stack: Rust 2024 edition, Axum 0.8, SQLx 0.8 (SQLite, runtime queries — no compile-time
-`query!` macros), argon2 password hashing, encrypted private cookies (`axum-extra`), SSE via a
-`tokio::sync::broadcast` channel.
+`query!` macros), argon2, encrypted private cookies (`axum-extra`), SSE over a
+`tokio::sync::broadcast` channel, `rand` for dice.
 
 ## Commands
 
 ```bash
 cargo build
-cargo test                       # integration tests in tests/, in-memory SQLite
-cargo test --test campaigns_integration <name>   # one test
-cargo clippy --all-targets       # keep warnings at zero in files you touch
-cargo fmt                        # format before committing
-cargo run                        # listens on 127.0.0.1:3001, runs migrations on boot
+cargo test                                   # unit tests + integration tests in tests/
+cargo test --test table_integration combat   # one test (substring match)
+cargo clippy --all-targets                   # must stay at zero warnings
+cargo fmt                                    # format before committing
+cargo run                                    # 127.0.0.1:3001, runs migrations on boot
+DATABASE_URL="sqlite:///tmp/pq-e2e.sqlite?mode=rwc" cargo run   # throwaway DB for e2e
 ```
 
 Config comes from env / `.env` (see `.env.example`): `APP_HOST`, `APP_PORT`, `DATABASE_URL`
-(default `sqlite://./dnd.sqlite?mode=rwc`), `ALLOWED_ORIGIN` (default `http://localhost:5173`),
-`COOKIE_SECRET`. Cloud sessions pre-build via `.claude/hooks/session-start.sh`.
+(default `sqlite://./dnd.sqlite?mode=rwc`, git-ignored), `ALLOWED_ORIGIN`, `COOKIE_SECRET`.
+Cloud sessions pre-build via `.claude/hooks/session-start.sh`.
+
+For end-to-end checks run the frontend playtest (`npm run playtest` in `../dnd`, see its
+AGENTS.md) against a backend on a throwaway database.
 
 ## Layout
 
 ```
 src/
-  main.rs          binary: tracing, config, pool, migrations, CORS, serve
-  lib.rs           re-exports modules so tests can build the router
-  config.rs        AppConfig::from_env
-  state/mod.rs     AppState { pool, cookie_key, config, encounter_sync_tx }
-  auth.rs          hash/verify password, session cookie, require_user()
-  db/mod.rs        connect(), payload (de)serialize, merge_json (shallow PATCH merge)
-  error.rs         ApiError → JSON { "error": "..." } with status
-  models/mod.rs    wire types (serde camelCase) — mirror of ../dnd/src/types
+  main.rs            binary: tracing, config, pool, migrations, CORS, serve (uses the lib crate)
+  lib.rs             module tree (tests build the router from here)
+  config.rs          AppConfig::from_env
+  state/mod.rs       AppState { pool, cookie_key, config, campaign_tx } + AppState::new / notify()
+  auth.rs            password hashing, session cookie, require_user()
+  access.rs          campaign_access() → CampaignAccess { campaign, role: Dm | Player }, require_dm()
+  dice.rs            dice notation parser/roller (mirrors ../dnd/src/utils/dice.ts), unit-tested
+  projection.rs      player visibility (LOS) and the player projection of an encounter, unit-tested
+  repo.rs            data helpers: table state, encounters, characters (as JSON), events
+  db/mod.rs          connect(), payload (de)serialize, merge_json (shallow PATCH merge)
+  error.rs           ApiError → JSON { "error": "..." } (bad_request/unauthorized/forbidden/not_found/conflict)
+  models/mod.rs      wire types (serde camelCase): Character, Encounter, TableState, Combat, …
   routes/
-    mod.rs         router(): all route registration lives here
-    auth.rs        /api/auth/{register,login,logout,me}
-    characters.rs  /api/characters[/{id}]            (owner-scoped)
-    notes.rs       /api/characters/{id}/notes, /api/notes/{id}
-    combat.rs      /api/combat/sessions[...], /api/combat/entries/{id}  (unused by frontend)
-    encounters.rs  /api/encounters/state (GET/PATCH whole blob), /api/encounters/stream (SSE)
-    campaigns.rs   /api/campaigns, members, invite regenerate, join by code
-migrations/        000N_name.sql, applied by sqlx::migrate! at startup and in tests
-tests/             end-to-end tests through the real router
+    mod.rs           router(): campaign routers are merged under /api/campaigns
+    auth.rs          /api/auth/{register,login,logout,me}
+    characters.rs    /api/characters[/{id}] (owner-scoped; changes notify the character's campaigns)
+    notes.rs         /api/characters/{id}/notes, /api/notes/{id}
+    campaigns.rs     list (role, live), create/rename/delete, members, invite, join, party sheets
+    encounters.rs    /{id}/encounters — DM map CRUD with optimistic concurrency (revision → 409)
+    entities.rs      /{id}/entities — quests/NPCs/places/handouts/loot, reveal, claim loot
+    sessions.rs      /{id}/sessions — start, end (publish log), edit log
+    table.rs         /{id}/table (snapshot), /stream (SSE), /events, /rolls, /actions
+migrations/          000N_name.sql, applied by sqlx::migrate! at startup and in tests
+tests/               common/ helpers + end-to-end tests through the real router
 ```
 
 ## Conventions
 
-- **Storage model:** most domain objects are stored as a JSON `payload TEXT` column plus a few
-  indexed columns (`id`, `user_id`, timestamps). Rust structs in `models/` are the schema; use
-  `#[serde(default)]` for every new field so old payloads keep deserializing (see
-  `characters_inventory_spells_integration::legacy_equipment_payload...`).
-- **PATCH = shallow merge** via `db::merge_json`: top-level keys in the patch replace keys in the
-  stored payload. Arrays are replaced wholesale.
-- **Auth:** every handler takes `PrivateCookieJar` and calls `require_user(&state.pool, &jar)`
-  first. Ownership checks are explicit SQL `WHERE ... AND user_id = ?`; return `404` (not 403)
-  for resources the caller can't see.
-- **Campaign authorization (when you add campaign-scoped data):** write a single helper that
-  returns the caller's role in a campaign — `Dm` if `campaigns.owner_user_id = user`, `Player` if
-  they have a `campaign_members` row, else `404`. DM-only data (monster HP, hidden fog, DM notes)
-  must be **filtered server-side** for players, not just hidden in the UI.
-- **Errors:** return `ApiError::{bad_request, unauthorized, not_found}` or `ApiError::new(status,
-  msg)`. `?` converts sqlx/serde/argon2 errors.
-- **Migrations:** add a new numbered file; never edit an applied one. SQLite: `TEXT` ids (uuid
-  v4), ISO-8601 `TEXT` timestamps from `models::now_iso()`, `ON DELETE CASCADE` foreign keys
-  (`PRAGMA foreign_keys = ON` is set in `db::connect`).
-- **Routes:** register in `routes/mod.rs` or a sub-`router()`; use Axum 0.8 path syntax
-  `/{id}`. Methods allowed by CORS: GET, POST, PATCH, DELETE.
-- **Live updates:** `state.encounter_sync_tx` broadcasts a `String` key; SSE handlers filter by
-  key. Today the key is a `user_id`. When sharing with a table, broadcast a `campaign_id` and
-  authorize the subscriber as a member.
+- **Storage model:** domain objects are JSON `payload TEXT` plus indexed columns. Rust structs in
+  `models/` are the schema; every new field gets `#[serde(default)]`. `Character`, `Encounter`,
+  monsters and tokens carry `#[serde(flatten)] extra` so fields owned by the frontend survive a
+  round trip — don't remove that.
+- **Auth first:** every handler takes `PrivateCookieJar` and calls `require_user`. Campaign-scoped
+  handlers then call `campaign_access(&state.pool, &id, &user.id)` (404 for outsiders) and
+  `.require_dm()` (403) where needed. Resources the caller can't see are 404, not 403.
+- **Hidden information is enforced here.** Players get `project_encounter_for_player` (no unseen
+  monsters, no HP/AC, `fog` terrain), unseen monsters are removed from combat, events about them
+  are `dm` visibility, hidden DCs are stripped, `dmNotes` are stripped, unrevealed entities are
+  filtered. Any new DM-only data needs the same treatment **and a test**.
+- **Shared state changes go through commands**, not blob PATCHes: add an `Action` variant in
+  `routes/table.rs`, record an event with `Ctx::event(kind, visibility, payload)`, and the handler
+  calls `state.notify(campaign_id, kind)` so SSE clients refetch.
+- **Event visibility:** `public` (everyone), `private` (actor + DM), `dm` (DM only).
+- **Errors:** `ApiError::{bad_request, unauthorized, forbidden, not_found, conflict}`; `?` converts
+  sqlx/serde/argon2 errors.
+- **Migrations:** add a new numbered file; never edit an applied one. TEXT uuid ids, ISO-8601 TEXT
+  timestamps (`models::now_iso()`), `ON DELETE CASCADE`. Foreign keys are enabled per connection
+  in `db::connect`. SQLite JSON1 (`json_extract`, `json_each`) is available.
+- **Routes:** Axum 0.8 path syntax `/{id}`; campaign routes live in their module's `router()` and
+  are merged in `routes/mod.rs`. Nested routers have **no trailing slash** (`/api/campaigns`).
 
 ## Testing
 
-Tests build the real router with `routes::router().with_state(state)` against
-`sqlite::memory:` and drive it with `tower::ServiceExt::oneshot`. Copy the helpers at the top of
-`tests/campaigns_integration.rs` (`test_app`, `register_and_get_cookie`, `response_json`,
-`first_cookie`). Every new endpoint needs: happy path, unauthenticated (401), and
-cross-user access (404). For campaign features, also test DM vs player visibility.
+Use `tests/common/mod.rs`: `test_app()` gives an in-memory app, `app.register(email)` returns a
+cookie, `app.call(method, uri, cookie, body)` returns `(StatusCode, Value)`, `app.ok(...)` asserts
+success, plus `character_json` and `corridor_encounter` fixtures. `tests/table_integration.rs`
+shows the pattern (a `Table` fixture with a DM, a player and a joined character).
 
-Gotcha: `db::connect` opens a pool of up to 5 connections and **each `sqlite::memory:` connection
-is a separate database**. Tests pass today because traffic is sequential, but if you see
-"no such table" in tests, use `sqlite:file:memdb_<uuid>?mode=memory&cache=shared` or a
-`max_connections(1)` pool for tests.
+Every new endpoint needs: happy path, unauthenticated (401), outsider (404), and player-vs-DM
+(403 or filtered output). For anything players see, assert what they **don't** receive.
+
+In-memory pools are single-connection (`db::connect` detects `:memory:`), because each SQLite
+memory connection is its own database.
 
 ## Known issues / tech debt
 
-- The session cookie value is the raw user id (encrypted + http-only, but no expiry or server-side
-  revocation). `COOKIE_SECRET` is padded/truncated to 64 bytes in `main.rs`; the default secret
-  is insecure — fine for local, not for deployment.
-- `encounter_states` is one JSON blob per **user**, not per campaign, so players can't see the
-  DM's battlefield. `combat_*` tables are unused by the frontend.
-- Quests, NPCs and session logs have no backend at all yet.
-- `dnd.sqlite` is committed; treat it as a dev fixture, don't rely on its contents, and don't
-  commit changes to it (`*.sqlite-wal`/`-shm` too).
-- `list_campaigns` does an N+1 member query — fine at table scale.
+- The session cookie value is the user id (encrypted + http-only) with no expiry or server-side
+  revocation. `COOKIE_SECRET` is padded/truncated to 64 bytes; the default secret is for dev only.
+- SSE uses one broadcast channel for all campaigns, filtered per subscriber — fine at table scale.
+- `list_campaigns` and the snapshot run several small queries; fine for a party of 6.
 
 ## Working agreement for agents
 
 1. API changes go together with the matching change in `../dnd` (types in `src/types`, store in
-   `src/store`). Keep field names camelCase on the wire.
+   `src/store`) and an update to the endpoint table in `../dnd/docs/GAMEPLAY.md` §5.
 2. `cargo fmt && cargo clippy --all-targets && cargo test` must be clean before committing.
 3. One roadmap item per PR; tick it in `../dnd/docs/GAMEPLAY.md`.
