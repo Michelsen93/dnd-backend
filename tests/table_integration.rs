@@ -591,3 +591,252 @@ async fn encounter_writes_use_optimistic_concurrency() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(t.snapshot(&t.dm).await["table"]["activeEncounterId"].is_null());
 }
+
+fn expected_outcome(roll: &Value, hits: bool) -> &'static str {
+    match roll["result"]["natural"].as_u64() {
+        Some(20) => "crit",
+        Some(1) => "miss",
+        _ if hits => "hit",
+        _ => "miss",
+    }
+}
+
+#[tokio::test]
+async fn targeted_attacks_resolve_hit_or_miss() {
+    let t = table().await;
+    live_encounter(&t).await;
+    let roll = |notation: &str, target: Value, kind: &str| {
+        json!({ "notation": notation, "label": "Shortsword attack", "characterId": t.character_id,
+                "rollKind": kind, "target": target })
+    };
+
+    // Pip attacks the visible goblin (AC 15): +100 always hits, -100 always misses (nat 20/1 aside).
+    let hit = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.player,
+            Some(roll(
+                "1d20+100",
+                json!({ "kind": "monster", "id": "gob" }),
+                "attack",
+            )),
+        )
+        .await;
+    assert_eq!(hit["payload"]["target"]["name"], "Goblin");
+    assert_eq!(
+        hit["payload"]["outcome"],
+        expected_outcome(&hit["payload"], true)
+    );
+    assert!(
+        !hit.to_string().contains("armorClass"),
+        "the target's AC is never sent"
+    );
+    let miss = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.player,
+            Some(roll(
+                "1d20-100",
+                json!({ "kind": "monster", "id": "gob" }),
+                "attack",
+            )),
+        )
+        .await;
+    assert_eq!(
+        miss["payload"]["outcome"],
+        expected_outcome(&miss["payload"], false)
+    );
+
+    // Damage rolls carry the target (so the DM's APPLY is pre-filled) but no outcome.
+    let damage = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.player,
+            Some(roll(
+                "1d6+2",
+                json!({ "kind": "monster", "id": "gob" }),
+                "damage",
+            )),
+        )
+        .await;
+    assert_eq!(damage["payload"]["target"]["id"], "gob");
+    assert!(damage["payload"]["outcome"].is_null());
+
+    // Players can't aim at the orc behind the wall, or at nonsense.
+    for target in [
+        json!({ "kind": "monster", "id": "orc" }),
+        json!({ "kind": "monster", "id": "nope" }),
+        json!({ "kind": "pc", "id": "nope" }),
+    ] {
+        let (status, _) = t
+            .app
+            .call(
+                "POST",
+                &t.url("/rolls"),
+                Some(&t.player),
+                Some(roll("1d20", target, "attack")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // The DM's goblin attacks Pip: resolved against Pip's AC.
+    let dm_attack = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.dm,
+            Some(
+                json!({ "notation": "1d20+100", "label": "Goblin: Scimitar", "rollKind": "attack",
+                         "target": { "kind": "pc", "id": t.character_id } }),
+            ),
+        )
+        .await;
+    assert_eq!(dm_attack["visibility"], "public");
+    assert_eq!(dm_attack["payload"]["target"]["name"], "Pip");
+    assert_eq!(
+        dm_attack["payload"]["outcome"],
+        expected_outcome(&dm_attack["payload"], true)
+    );
+
+    // The DM aiming at the hidden orc stays behind the screen.
+    let secret = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.dm,
+            Some(
+                json!({ "notation": "1d20", "label": "Test", "rollKind": "attack",
+                         "target": { "kind": "monster", "id": "orc" } }),
+            ),
+        )
+        .await;
+    assert_eq!(secret["visibility"], "dm");
+    let player_view = t.snapshot(&t.player).await;
+    assert!(!player_view["events"].to_string().contains("Orc"));
+}
+
+// ── Table screens (TV) ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tv_screen_pairs_and_sees_only_the_party_view() {
+    let t = table().await;
+    let outsider = t.app.register("outsider@example.com").await;
+    live_encounter(&t).await;
+    t.app.ok("POST", &t.url("/sessions"), &t.dm, None).await;
+    t.app
+        .ok(
+            "POST",
+            &t.url("/events"),
+            &t.dm,
+            Some(json!({ "text": "The orc is the mayor's brother", "visibility": "dm" })),
+        )
+        .await;
+    t.app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.player,
+            Some(json!({ "notation": "1d20", "label": "Sneaky", "characterId": t.character_id, "secret": true })),
+        )
+        .await;
+    t.app
+        .ok(
+            "POST",
+            &t.url("/rolls"),
+            &t.player,
+            Some(json!({ "notation": "1d20+5", "label": "Perception", "characterId": t.character_id })),
+        )
+        .await;
+
+    // Only the DM can make a pairing code.
+    let (status, _) = t
+        .app
+        .call("POST", &t.url("/screens"), Some(&t.player), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = t
+        .app
+        .call("POST", &t.url("/screens"), Some(&outsider), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = t.app.call("POST", &t.url("/screens"), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let code = t.app.ok("POST", &t.url("/screens"), &t.dm, None).await;
+    let code = code["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+
+    // The TV pairs without an account; lower-case and spaces are forgiven. Codes are single-use.
+    let typed = format!(" {} ", code.to_lowercase());
+    let (status, paired) = t
+        .app
+        .call(
+            "POST",
+            "/api/screen/pair",
+            None,
+            Some(json!({ "code": typed })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(paired["campaignName"], "Stormreach");
+    let token = paired["token"].as_str().unwrap().to_string();
+    let (status, _) = t
+        .app
+        .call(
+            "POST",
+            "/api/screen/pair",
+            None,
+            Some(json!({ "code": code })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let status_view = t.app.ok("GET", &t.url("/screens"), &t.dm, None).await;
+    assert_eq!(status_view["screens"], 1);
+
+    let (status, screen) = t
+        .app
+        .call("GET", &format!("/api/screen/{token}/table"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = screen.to_string();
+    assert_eq!(screen["campaign"]["name"], "Stormreach");
+    assert_eq!(screen["party"][0]["name"], "Pip");
+    assert!(
+        screen["party"][0].get("attacks").is_none(),
+        "a summary, not the sheet"
+    );
+    assert_eq!(screen["encounter"]["monsters"].as_array().unwrap().len(), 1);
+    assert!(!text.contains("Orc"), "no hidden monsters");
+    assert!(!text.contains("hitPointsMax\":7"), "no monster HP");
+    assert!(!text.contains("mayor's brother"), "no DM notes");
+    assert!(!text.contains("Sneaky"), "no private rolls");
+    assert!(text.contains("Perception"), "public rolls are there");
+    assert!(screen["campaign"].get("inviteCode").is_none());
+
+    // Unknown tokens are refused; the DM can unpair every screen.
+    let (status, _) = t
+        .app
+        .call("GET", "/api/screen/not-a-token/table", None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = t
+        .app
+        .call("DELETE", &t.url("/screens"), Some(&t.dm), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = t
+        .app
+        .call("GET", &format!("/api/screen/{token}/table"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

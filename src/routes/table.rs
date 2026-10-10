@@ -120,7 +120,7 @@ async fn snapshot(
 }
 
 /// Players must not learn about monsters they cannot see from the initiative order.
-fn hide_unseen_combatants(combat: &mut Combat, encounter: &Encounter) {
+pub fn hide_unseen_combatants(combat: &mut Combat, encounter: &Encounter) {
     let visibility = projection::player_visibility(encounter);
     let current_id = combat
         .combatants
@@ -147,6 +147,14 @@ async fn stream(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
     campaign_access(&state.pool, &id, &user.id).await?;
+    Ok(campaign_stream(&state, id))
+}
+
+/// SSE for one campaign: `update` events plus pings. Shared by members and paired screens.
+pub fn campaign_stream(
+    state: &AppState,
+    id: String,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + use<>> {
     let rx = state.campaign_tx.subscribe();
 
     let updates = BroadcastStream::new(rx).filter_map(move |msg| match msg {
@@ -169,7 +177,7 @@ async fn stream(
         tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(10)))
             .map(|_| Ok(Event::default().event("ping").data("ping")));
 
-    Ok(Sse::new(hello.chain(updates.merge(pings))))
+    Sse::new(hello.chain(updates.merge(pings)))
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -283,9 +291,90 @@ struct RollInput {
     request_id: Option<String>,
     #[serde(default)]
     secret: bool,
-    /// Optional free-form context (attack target, damage type, …) shown in the feed.
+    /// Optional free-form context (damage type, attack id, …) shown in the feed.
     #[serde(default)]
     meta: Option<Value>,
+    /// What an attack, damage or heal roll is aimed at. Attacks get a HIT/MISS against its AC.
+    #[serde(default)]
+    target: Option<RollTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RollTarget {
+    /// "monster" (in the live encounter) or "pc" (a party member)
+    kind: String,
+    id: String,
+}
+
+/// A resolved roll target: its public description, AC (never sent to players) and whether
+/// players may know about it at all.
+struct ResolvedTarget {
+    public: Value,
+    armor_class: i32,
+    seen: bool,
+}
+
+async fn resolve_target(
+    state: &AppState,
+    campaign_id: &str,
+    target: &RollTarget,
+    is_dm: bool,
+) -> Result<ResolvedTarget, ApiError> {
+    match target.kind.as_str() {
+        "monster" => {
+            let table = repo::load_table_state(&state.pool, campaign_id).await?;
+            let encounter = match &table.active_encounter_id {
+                Some(eid) => repo::load_encounter(&state.pool, campaign_id, eid).await?,
+                None => return Err(ApiError::bad_request("No encounter is live")),
+            };
+            let monster = encounter
+                .monsters
+                .iter()
+                .find(|m| m.id == target.id)
+                .ok_or_else(|| ApiError::not_found("Target not found"))?;
+            let seen = monster_event_visibility(&encounter, &monster.id) == "public";
+            // Players can only aim at what their party can see.
+            if !is_dm && !seen {
+                return Err(ApiError::not_found("Target not found"));
+            }
+            Ok(ResolvedTarget {
+                public: json!({ "kind": "monster", "id": monster.id, "name": monster.name }),
+                armor_class: monster.armor_class,
+                seen,
+            })
+        }
+        "pc" => {
+            let members = repo::member_character_ids(&state.pool, campaign_id).await?;
+            if !members.contains(&target.id) {
+                return Err(ApiError::not_found("Target not found"));
+            }
+            let record = repo::load_character(&state.pool, &target.id).await?;
+            let name = record
+                .value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            Ok(ResolvedTarget {
+                public: json!({ "kind": "pc", "id": target.id, "name": name }),
+                armor_class: repo::json_i64(&record.value, "armorClass") as i32,
+                seen: true,
+            })
+        }
+        _ => Err(ApiError::bad_request(
+            "target.kind must be 'monster' or 'pc'",
+        )),
+    }
+}
+
+/// HIT/MISS for an attack roll: a natural 20 always hits (critically), a natural 1 always misses.
+pub fn attack_outcome(result: &dice::RollResult, armor_class: i32) -> &'static str {
+    match result.natural {
+        Some(20) => "crit",
+        Some(1) => "miss",
+        _ if result.total >= armor_class => "hit",
+        _ => "miss",
+    }
 }
 
 async fn roll(
@@ -327,7 +416,18 @@ async fn roll(
         .clone()
         .unwrap_or_else(|| "custom".to_string());
 
+    let target = match &input.target {
+        Some(target) => Some(resolve_target(&state, &id, target, access.is_dm()).await?),
+        None => None,
+    };
+    let outcome = match (&target, roll_kind.as_str()) {
+        (Some(target), "attack") => Some(attack_outcome(&result, target.armor_class)),
+        _ => None,
+    };
+
     let visibility = match (input.secret, access.is_dm()) {
+        // The DM aiming at a monster the players can't see keeps the roll behind the screen.
+        (false, true) if target.as_ref().is_some_and(|t| !t.seen) => "dm",
         (false, _) => "public",
         (true, true) => "dm",
         (true, false) => "private",
@@ -352,6 +452,8 @@ async fn roll(
             "advantage": input.advantage,
             "requestId": input.request_id,
             "meta": input.meta,
+            "target": target.as_ref().map(|t| t.public.clone()),
+            "outcome": outcome,
             "result": result,
         }),
     )
@@ -1198,7 +1300,7 @@ impl Ctx<'_> {
 }
 
 /// Events about a monster the players cannot see must stay behind the DM screen.
-fn monster_event_visibility(encounter: &Encounter, monster_id: &str) -> &'static str {
+pub fn monster_event_visibility(encounter: &Encounter, monster_id: &str) -> &'static str {
     let visibility = projection::player_visibility(encounter);
     let seen = encounter
         .monsters
@@ -1285,6 +1387,23 @@ pub fn apply_long_rest(character: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attack_outcomes() {
+        let roll = |natural: u32, total: i32| dice::RollResult {
+            notation: "1d20".into(),
+            groups: vec![],
+            modifier: 0,
+            total,
+            natural: Some(natural),
+            crit: natural == 20,
+            fumble: natural == 1,
+        };
+        assert_eq!(attack_outcome(&roll(12, 15), 15), "hit");
+        assert_eq!(attack_outcome(&roll(11, 14), 15), "miss");
+        assert_eq!(attack_outcome(&roll(20, 22), 30), "crit");
+        assert_eq!(attack_outcome(&roll(1, 25), 10), "miss");
+    }
 
     #[test]
     fn damage_uses_temp_hp_then_knocks_out() {
