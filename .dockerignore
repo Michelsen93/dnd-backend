@@ -1,0 +1,8 @@
+target
+.git
+.claude
+*.sqlite
+*.sqlite-*
+.env
+tests
+.replica

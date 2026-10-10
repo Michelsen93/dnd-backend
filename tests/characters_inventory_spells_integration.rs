@@ -1,17 +1,19 @@
 use axum::{
-    body::Body,
-    http::{header, Request, StatusCode},
     Router,
+    body::Body,
+    http::{Request, StatusCode, header},
 };
 use axum_extra::extract::cookie::Key;
 use backend::{db, routes, state::AppState};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tower::ServiceExt;
 
 async fn test_app() -> (Router, SqlitePool) {
-    let pool = db::connect("sqlite::memory:").await.expect("connect sqlite");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("connect sqlite");
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -21,22 +23,21 @@ async fn test_app() -> (Router, SqlitePool) {
     let seed = b"characters-integration-tests-key-seed";
     bytes[..seed.len()].copy_from_slice(seed);
 
-    let (encounter_sync_tx, _encounter_sync_rx) = tokio::sync::broadcast::channel::<String>(16);
-
-    let state = AppState {
-        pool: pool.clone(),
-        cookie_key: Key::from(&bytes),
-        config: backend::config::AppConfig {
+    let state = AppState::new(
+        pool.clone(),
+        Key::from(&bytes),
+        backend::config::AppConfig {
             app_host: "127.0.0.1".to_string(),
             app_port: 3001,
             database_url: "sqlite::memory:".to_string(),
             allowed_origin: "http://localhost:5173".to_string(),
             cookie_secret: "characters-integration-tests-key-seed".to_string(),
+            cookie_secure: false,
+            firebase_project_id: None,
         },
-        encounter_sync_tx,
-    };
+    );
 
-    (routes::router().with_state(state), pool)
+    (routes::app(state), pool)
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -65,12 +66,11 @@ async fn register_and_get_cookie(app: &Router, email: &str) -> String {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/register")
+                .uri("/api/auth/dev-login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
-                        "email": email,
-                        "password": "supersecure-password"
+                        "email": email
                     })
                     .to_string(),
                 ))
@@ -79,7 +79,7 @@ async fn register_and_get_cookie(app: &Router, email: &str) -> String {
         .await
         .expect("register request");
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     first_cookie(&response)
 }
 
@@ -166,9 +166,27 @@ async fn character_payload_roundtrips_inventory_spells_and_abilities() {
         .expect("character id")
         .to_string();
 
-    assert_eq!(created.get("inventory").and_then(Value::as_array).map(|items| items.len()), Some(2));
-    assert_eq!(created.get("spells").and_then(Value::as_array).map(|items| items.len()), Some(2));
-    assert_eq!(created.get("abilities").and_then(Value::as_array).map(|items| items.len()), Some(1));
+    assert_eq!(
+        created
+            .get("inventory")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(2)
+    );
+    assert_eq!(
+        created
+            .get("spells")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(2)
+    );
+    assert_eq!(
+        created
+            .get("abilities")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(1)
+    );
 
     let patch_response = app
         .clone()
@@ -198,12 +216,14 @@ async fn character_payload_roundtrips_inventory_spells_and_abilities() {
 
     assert_eq!(patch_response.status(), StatusCode::OK);
     let patched = response_json(patch_response).await;
-    assert!(patched
-        .get("inventory")
-        .and_then(Value::as_array)
-        .expect("patched inventory")
-        .iter()
-        .any(|item| item.get("name").and_then(Value::as_str) == Some("Potion of Healing")));
+    assert!(
+        patched
+            .get("inventory")
+            .and_then(Value::as_array)
+            .expect("patched inventory")
+            .iter()
+            .any(|item| item.get("name").and_then(Value::as_str) == Some("Potion of Healing"))
+    );
 
     let list_response = app
         .clone()

@@ -1,10 +1,15 @@
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use axum_extra::extract::PrivateCookieJar;
 
 use crate::{
     auth::require_user,
-    db::{deserialize_payload, serialize_payload, PayloadRow},
+    db::{PayloadRow, deserialize_payload, serialize_payload},
     error::ApiError,
+    limits,
     models::{NewNote, Note, UpdateNote},
     state::AppState,
 };
@@ -41,8 +46,18 @@ pub async fn create_for_character(
 ) -> Result<(StatusCode, Json<Note>), ApiError> {
     let user = require_user(&state.pool, &jar).await?;
     ensure_character_access(&state, &user.id, &character_id).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes WHERE character_id = ?")
+        .bind(&character_id)
+        .fetch_one(&state.pool)
+        .await?;
+    limits::ensure_quota(
+        count,
+        limits::MAX_NOTES_PER_CHARACTER,
+        "journal entries per character",
+    )?;
 
     let note = input.into_note(character_id.clone());
+    limits::ensure_size(&note, limits::MAX_NOTE_BYTES, "Journal entry")?;
     sqlx::query(
         "INSERT INTO notes (id, user_id, character_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -65,14 +80,13 @@ pub async fn update(
     Json(patch): Json<UpdateNote>,
 ) -> Result<Json<Note>, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
-    let row = sqlx::query_as::<_, PayloadRow>(
-        "SELECT payload FROM notes WHERE id = ? AND user_id = ?",
-    )
-    .bind(&id)
-    .bind(&user.id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::not_found("Note not found"))?;
+    let row =
+        sqlx::query_as::<_, PayloadRow>("SELECT payload FROM notes WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(&user.id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Note not found"))?;
 
     let mut note: Note = deserialize_payload(&row.payload)?;
     if let Some(title) = patch.title {
@@ -82,6 +96,7 @@ pub async fn update(
         note.content = content;
     }
     note.updated_at = crate::models::now_iso();
+    limits::ensure_size(&note, limits::MAX_NOTE_BYTES, "Journal entry")?;
 
     sqlx::query("UPDATE notes SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?")
         .bind(serialize_payload(&note)?)
@@ -113,12 +128,17 @@ pub async fn delete_note(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ensure_character_access(state: &AppState, user_id: &str, character_id: &str) -> Result<(), ApiError> {
-    let exists = sqlx::query_scalar::<_, String>("SELECT id FROM characters WHERE id = ? AND user_id = ?")
-        .bind(character_id)
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await?;
+async fn ensure_character_access(
+    state: &AppState,
+    user_id: &str,
+    character_id: &str,
+) -> Result<(), ApiError> {
+    let exists =
+        sqlx::query_scalar::<_, String>("SELECT id FROM characters WHERE id = ? AND user_id = ?")
+            .bind(character_id)
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if exists.is_none() {
         return Err(ApiError::not_found("Character not found"));

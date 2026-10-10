@@ -1,20 +1,8 @@
-mod auth;
-mod config;
-mod db;
-mod error;
-mod models;
-mod routes;
-mod state;
-
 use axum::Router;
 use axum::http::{HeaderValue, Method, header};
 use axum_extra::extract::cookie::Key;
-use config::AppConfig;
-use state::AppState;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-};
+use backend::{config::AppConfig, db, routes, state::AppState};
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -23,38 +11,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "backend=debug,tower_http=debug".to_string()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "backend=debug,tower_http=debug".to_string()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let config = AppConfig::from_env();
+    if config.cookie_secure && std::env::var("COOKIE_SECRET").is_err() {
+        return Err("COOKIE_SECRET must be set in production (COOKIE_SECURE=true)".into());
+    }
+    if config.cookie_secure && config.firebase_project_id.is_none() {
+        // Without Firebase the passwordless dev login would be open to the internet.
+        return Err("FIREBASE_PROJECT_ID must be set in production (COOKIE_SECURE=true)".into());
+    }
     let pool = db::connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
-    let (encounter_sync_tx, _encounter_sync_rx) = tokio::sync::broadcast::channel::<String>(64);
-
-    let shared_state = AppState {
+    let shared_state = AppState::new(
         pool,
-        cookie_key: cookie_key_from_secret(&config.cookie_secret),
-        config: config.clone(),
-        encounter_sync_tx,
-    };
+        cookie_key_from_secret(&config.cookie_secret),
+        config.clone(),
+    );
 
     let cors = CorsLayer::new()
         .allow_origin(HeaderValue::from_str(&config.allowed_origin)?)
         .allow_credentials(true)
         .allow_headers([header::ACCEPT, header::CONTENT_TYPE])
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS]);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ]);
 
-    let app: Router = routes::router()
+    let app: Router = routes::app(shared_state)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(shared_state);
+        // API responses are per-user; never let a CDN (Firebase Hosting) cache them.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ));
 
     let listener = tokio::net::TcpListener::bind(config.bind_address()).await?;
     tracing::info!(address = %listener.local_addr()?, "backend listening");
-    axum::serve(listener, app).await?;
+    // Exit promptly on SIGTERM/Ctrl-C instead of draining: live SSE streams never finish on their
+    // own, and in the container Litestream needs the server gone to run its final sync before
+    // Cloud Run's 10 s shutdown deadline.
+    tokio::select! {
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result?,
+        _ = shutdown_signal() => tracing::info!("shutdown signal received, exiting"),
+    }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sigterm.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn cookie_key_from_secret(secret: &str) -> Key {

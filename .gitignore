@@ -1,3 +1,8 @@
 /target
 
-.DS_Store
+# Local dev databases
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.replica/

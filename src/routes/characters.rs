@@ -1,11 +1,16 @@
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use axum_extra::extract::PrivateCookieJar;
 use serde_json::Value;
 
 use crate::{
     auth::require_user,
-    db::{character_from_row, deserialize_payload, merge_json, serialize_payload, PayloadRow},
+    db::{PayloadRow, character_from_row, deserialize_payload, merge_json, serialize_payload},
     error::ApiError,
+    limits,
     models::{Character, NewCharacter},
     state::AppState,
 };
@@ -54,7 +59,14 @@ pub async fn create(
     Json(input): Json<NewCharacter>,
 ) -> Result<(StatusCode, Json<Character>), ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM characters WHERE user_id = ?")
+        .bind(&user.id)
+        .fetch_one(&state.pool)
+        .await?;
+    limits::ensure_quota(count, limits::MAX_CHARACTERS_PER_USER, "characters")?;
     let character = input.into_character();
+    limits::ensure_chars(&character.name, limits::MAX_NAME_CHARS, "Name")?;
+    limits::ensure_size(&character, limits::MAX_CHARACTER_BYTES, "Character")?;
     let payload = serialize_payload(&character)?;
 
     sqlx::query(
@@ -92,6 +104,8 @@ pub async fn update(
     updated.id = current.id;
     updated.created_at = current.created_at;
     updated.updated_at = crate::models::now_iso();
+    limits::ensure_chars(&updated.name, limits::MAX_NAME_CHARS, "Name")?;
+    limits::ensure_size(&updated, limits::MAX_CHARACTER_BYTES, "Character")?;
 
     sqlx::query("UPDATE characters SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?")
         .bind(serialize_payload(&updated)?)
@@ -100,6 +114,16 @@ pub async fn update(
         .bind(&user.id)
         .execute(&state.pool)
         .await?;
+
+    sqlx::query(
+        "UPDATE campaign_members SET character_name = ?, sprite_key = ? WHERE character_id = ?",
+    )
+    .bind(&updated.name)
+    .bind(&updated.sprite_key)
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+    crate::repo::notify_character_campaigns(&state, &id).await?;
 
     Ok(Json(updated))
 }
@@ -110,6 +134,7 @@ pub async fn delete_character(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    crate::repo::notify_character_campaigns(&state, &id).await?;
     let result = sqlx::query("DELETE FROM characters WHERE id = ? AND user_id = ?")
         .bind(&id)
         .bind(&user.id)

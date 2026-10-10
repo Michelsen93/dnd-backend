@@ -4,21 +4,33 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-argon2 = "0.5.3"
 axum = { version = "0.8.6", features = ["macros"] }
 axum-extra = { version = "0.10.3", features = ["cookie-private"] }
 chrono = { version = "0.4.42", features = ["serde", "clock"] }
 dotenvy = "0.15.7"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+rand = "0.8.5"
+jsonwebtoken = "9.3.1"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10.9"
+cookie = "0.18.1"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
-tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net"] }
-tokio-stream = { version = "0.1.17", features = ["sync"] }
-tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+tokio-stream = { version = "0.1.17", features = ["sync", "time"] }
+tower-http = { version = "0.6.6", features = ["cors", "trace", "set-header"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+rsa = { version = "0.9.8", features = ["pem"] }
 http-body-util = "0.1.3"
 tower = { version = "0.5.3", features = ["util"] }
+
+# Test-only RSA key generation is painfully slow unoptimized.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

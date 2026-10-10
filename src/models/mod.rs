@@ -23,12 +23,6 @@ pub struct AuthResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Credentials {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AbilityKey {
     #[serde(rename = "str")]
@@ -163,6 +157,9 @@ pub struct Character {
     pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Fields owned by the frontend (attacks, conditions, …) pass through untouched.
+    #[serde(flatten)]
+    pub extra: JsonMap,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +208,8 @@ pub struct NewCharacter {
     pub backstory: String,
     pub sprite_key: String,
     pub avatar_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: JsonMap,
 }
 
 impl NewCharacter {
@@ -258,6 +257,7 @@ impl NewCharacter {
             avatar_url: self.avatar_url,
             created_at: now.clone(),
             updated_at: now,
+            extra: self.extra,
         }
     }
 }
@@ -307,90 +307,133 @@ pub struct UpdateNote {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CombatEntry {
-    pub id: String,
-    pub name: String,
-    pub character_id: Option<String>,
-    pub initiative: i32,
-    pub initiative_roll: Option<i32>,
-    pub hit_points_max: i32,
-    pub hit_points_current: i32,
-    pub armor_class: i32,
-    pub conditions: Vec<String>,
-    pub is_player: bool,
-    pub sprite_key: Option<String>,
-    pub note: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewCombatEntry {
-    pub name: String,
-    pub character_id: Option<String>,
-    pub initiative: i32,
-    pub initiative_roll: Option<i32>,
-    pub hit_points_max: i32,
-    pub hit_points_current: i32,
-    pub armor_class: i32,
-    pub conditions: Vec<String>,
-    pub is_player: bool,
-    pub sprite_key: Option<String>,
-    pub note: String,
-}
-
-impl NewCombatEntry {
-    pub fn into_entry(self) -> CombatEntry {
-        CombatEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: self.name,
-            character_id: self.character_id,
-            initiative: self.initiative,
-            initiative_roll: self.initiative_roll,
-            hit_points_max: self.hit_points_max,
-            hit_points_current: self.hit_points_current,
-            armor_class: self.armor_class,
-            conditions: self.conditions,
-            is_player: self.is_player,
-            sprite_key: self.sprite_key,
-            note: self.note,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CombatSession {
-    pub id: String,
-    pub name: Option<String>,
-    pub entries: Vec<CombatEntry>,
-    pub round: i32,
-    pub active_index: i32,
-    pub started: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateCombatSession {
-    pub name: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateCombatSession {
-    pub name: Option<String>,
-    pub round: Option<i32>,
-    pub active_index: Option<i32>,
-    pub started: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub status: String,
 }
 
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+// ── Shared table ──────────────────────────────────────────────────────────────
+
+pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BattlefieldMonster {
+    pub id: String,
+    pub name: String,
+    pub sprite_key: String,
+    pub x: i32,
+    pub y: i32,
+    pub hit_points_max: i32,
+    pub hit_points_current: i32,
+    pub armor_class: i32,
+    #[serde(default)]
+    pub conditions: Vec<String>,
+    /// Initiative modifier (DEX mod) used when the server rolls initiative.
+    #[serde(default)]
+    pub dex_mod: i32,
+    /// XP value awarded when defeated.
+    #[serde(default)]
+    pub xp: i32,
+    #[serde(flatten)]
+    pub extra: JsonMap,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerToken {
+    pub id: String,
+    #[serde(default)]
+    pub character_id: Option<String>,
+    pub name: String,
+    pub sprite_key: String,
+    pub x: i32,
+    pub y: i32,
+    pub vision_radius: i32,
+    #[serde(flatten)]
+    pub extra: JsonMap,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Encounter {
+    pub id: String,
+    pub campaign_id: String,
+    pub name: String,
+    pub grid_cols: i32,
+    pub grid_rows: i32,
+    pub terrain: Vec<Vec<String>>,
+    pub visibility: Vec<Vec<bool>>,
+    #[serde(default)]
+    pub monsters: Vec<BattlefieldMonster>,
+    #[serde(default)]
+    pub player_tokens: Vec<PlayerToken>,
+    #[serde(default = "default_true")]
+    pub los_block_by_walls: bool,
+    /// Bumped by the server on every write; clients send it back for optimistic concurrency.
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(flatten)]
+    pub extra: JsonMap,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Combatant {
+    pub id: String,
+    /// "monster" or "pc"
+    pub kind: String,
+    /// Monster id (in the active encounter) or character id.
+    pub ref_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub sprite_key: String,
+    #[serde(default)]
+    pub initiative: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Combat {
+    pub round: i32,
+    pub turn_index: usize,
+    pub combatants: Vec<Combatant>,
+    /// Number of turns advanced so far. While 0, late initiative rolls re-sort and the
+    /// turn stays at the top of the order (nobody has acted yet).
+    #[serde(default)]
+    pub turns_taken: i32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Spotlight {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub sprite_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableState {
+    #[serde(default)]
+    pub active_encounter_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub combat: Option<Combat>,
+    #[serde(default)]
+    pub spotlight: Option<Spotlight>,
 }

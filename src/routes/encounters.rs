@@ -1,97 +1,148 @@
+//! Campaign encounters (maps). Only the DM reads or writes them directly; players see the
+//! live encounter through the projected table snapshot.
+
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
-    routing::get,
     Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, put},
 };
 use axum_extra::extract::PrivateCookieJar;
-use serde_json::{json, Value};
-use std::{convert::Infallible, time::Duration};
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::{
-    auth::require_user,
-    error::ApiError,
+    access::campaign_access, auth::require_user, error::ApiError, models::Encounter, repo,
     state::AppState,
 };
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/state", get(get_state).patch(set_state))
-        .route("/stream", get(stream_updates))
+        .route("/{id}/encounters", get(list).post(create))
+        .route(
+            "/{id}/encounters/{encounter_id}",
+            put(replace).delete(remove),
+        )
 }
 
-pub async fn get_state(
+async fn list(
     State(state): State<AppState>,
     jar: PrivateCookieJar,
-) -> Result<Json<Value>, ApiError> {
+    Path(id): Path<String>,
+) -> Result<Json<Vec<Encounter>>, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    campaign_access(&state.pool, &id, &user.id)
+        .await?
+        .require_dm()?;
+    Ok(Json(repo::list_encounters(&state.pool, &id).await?))
+}
 
-    let row = sqlx::query_as::<_, crate::db::PayloadRow>(
-        "SELECT payload FROM encounter_states WHERE user_id = ?",
-    )
-    .bind(&user.id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    if let Some(row) = row {
-        let payload: Value = serde_json::from_str(&row.payload)?;
-        return Ok(Json(payload));
+fn validate(encounter: &Encounter) -> Result<(), ApiError> {
+    crate::limits::ensure_chars(&encounter.name, crate::limits::MAX_NAME_CHARS, "Map name")?;
+    if encounter.monsters.len() > 200 || encounter.player_tokens.len() > 50 {
+        return Err(ApiError::bad_request("Too many tokens on one map"));
     }
-
-    Ok(Json(json!({ "encounters": [] })))
-}
-
-pub async fn set_state(
-    State(state): State<AppState>,
-    jar: PrivateCookieJar,
-    Json(payload): Json<Value>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let user = require_user(&state.pool, &jar).await?;
-
-    let Some(encounters) = payload.get("encounters") else {
-        return Err(ApiError::bad_request("Payload must include 'encounters'"));
+    if !(1..=40).contains(&encounter.grid_cols) || !(1..=40).contains(&encounter.grid_rows) {
+        return Err(ApiError::bad_request(
+            "Grid must be between 1 and 40 cells per side",
+        ));
+    }
+    let rows_ok = |rows: usize, cols: Vec<usize>| {
+        rows == encounter.grid_rows as usize
+            && cols.iter().all(|&c| c == encounter.grid_cols as usize)
     };
-    if !encounters.is_array() {
-        return Err(ApiError::bad_request("'encounters' must be an array"));
+    if !rows_ok(
+        encounter.terrain.len(),
+        encounter.terrain.iter().map(Vec::len).collect(),
+    ) || !rows_ok(
+        encounter.visibility.len(),
+        encounter.visibility.iter().map(Vec::len).collect(),
+    ) {
+        return Err(ApiError::bad_request(
+            "terrain and visibility must match the grid size",
+        ));
     }
-
-    let now = crate::models::now_iso();
-    sqlx::query(
-        "INSERT INTO encounter_states (user_id, payload, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
-    )
-    .bind(&user.id)
-    .bind(serde_json::to_string(&payload)?)
-    .bind(&now)
-    .execute(&state.pool)
-    .await?;
-
-    let _ = state.encounter_sync_tx.send(user.id.clone());
-
-    Ok((StatusCode::OK, Json(payload)))
+    Ok(())
 }
 
-pub async fn stream_updates(
+async fn create(
     State(state): State<AppState>,
     jar: PrivateCookieJar,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    Path(id): Path<String>,
+    Json(mut encounter): Json<Encounter>,
+) -> Result<(StatusCode, Json<Encounter>), ApiError> {
     let user = require_user(&state.pool, &jar).await?;
-    let user_id = user.id;
-    let rx = state.encounter_sync_tx.subscribe();
+    campaign_access(&state.pool, &id, &user.id)
+        .await?
+        .require_dm()?;
+    validate(&encounter)?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encounters WHERE campaign_id = ?")
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await?;
+    crate::limits::ensure_quota(
+        count,
+        crate::limits::MAX_ENCOUNTERS_PER_CAMPAIGN,
+        "maps per campaign",
+    )?;
+    if encounter.id.trim().is_empty() {
+        encounter.id = uuid::Uuid::new_v4().to_string();
+    }
+    encounter.campaign_id = id.clone();
+    encounter.revision = 0;
+    encounter.created_at = String::new();
+    repo::save_encounter(&state.pool, &mut encounter).await?;
+    state.notify(&id, "encounters");
+    Ok((StatusCode::CREATED, Json(encounter)))
+}
 
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok(changed_user_id) if changed_user_id == user_id => {
-            Some(Ok(Event::default().event("updated").data("encounters-updated")))
-        }
-        _ => None,
-    });
+/// Full replace with optimistic concurrency: the body's `revision` must match the stored one,
+/// otherwise 409 with the current encounter so the client can rebase.
+async fn replace(
+    State(state): State<AppState>,
+    jar: PrivateCookieJar,
+    Path((id, encounter_id)): Path<(String, String)>,
+    Json(mut encounter): Json<Encounter>,
+) -> Result<Response, ApiError> {
+    let user = require_user(&state.pool, &jar).await?;
+    campaign_access(&state.pool, &id, &user.id)
+        .await?
+        .require_dm()?;
+    validate(&encounter)?;
+    let current = repo::load_encounter(&state.pool, &id, &encounter_id).await?;
+    if current.revision != encounter.revision {
+        return Ok((StatusCode::CONFLICT, Json(current)).into_response());
+    }
+    encounter.id = current.id;
+    encounter.campaign_id = id.clone();
+    encounter.created_at = current.created_at;
+    repo::save_encounter(&state.pool, &mut encounter).await?;
+    state.notify(&id, "encounters");
+    Ok(Json(encounter).into_response())
+}
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+async fn remove(
+    State(state): State<AppState>,
+    jar: PrivateCookieJar,
+    Path((id, encounter_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state.pool, &jar).await?;
+    campaign_access(&state.pool, &id, &user.id)
+        .await?
+        .require_dm()?;
+    let result = sqlx::query("DELETE FROM encounters WHERE id = ? AND campaign_id = ?")
+        .bind(&encounter_id)
+        .bind(&id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("Encounter not found"));
+    }
+    let mut table = repo::load_table_state(&state.pool, &id).await?;
+    if table.active_encounter_id.as_deref() == Some(encounter_id.as_str()) {
+        table.active_encounter_id = None;
+        table.combat = None;
+        repo::save_table_state(&state.pool, &id, &table).await?;
+    }
+    state.notify(&id, "encounters");
+    Ok(StatusCode::NO_CONTENT)
 }

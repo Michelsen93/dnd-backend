@@ -1,4 +1,8 @@
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -28,6 +32,14 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, message)
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
@@ -47,18 +59,17 @@ impl IntoResponse for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        // Log the details; never send database internals to the browser.
+        tracing::error!(%error, "database error");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side. Try again.",
+        )
     }
 }
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::bad_request(error.to_string())
-    }
-}
-
-impl From<argon2::password_hash::Error> for ApiError {
-    fn from(error: argon2::password_hash::Error) -> Self {
         Self::bad_request(error.to_string())
     }
 }
