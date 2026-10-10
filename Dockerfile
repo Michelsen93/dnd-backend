@@ -19,6 +19,7 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /data
 
 ENV APP_HOST=0.0.0.0 \
+    PORT=8080 \
     DB_PATH=/data/dnd.sqlite \
     RUST_LOG=backend=info,tower_http=warn
 EXPOSE 8080

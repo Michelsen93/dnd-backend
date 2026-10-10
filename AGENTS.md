@@ -11,7 +11,8 @@ sibling repo `michelsen93/dnd` (checked out at `../dnd`); its `AGENTS.md` descri
 its **`docs/GAMEPLAY.md` holds the gameplay design, the endpoint table, and the roadmap**.
 
 Stack: Rust 2024 edition, Axum 0.8, SQLx 0.8 (SQLite, runtime queries — no compile-time
-`query!` macros), argon2, encrypted private cookies (`axum-extra`), SSE over a
+`query!` macros), Firebase ID tokens verified with `jsonwebtoken` (Google keys fetched via
+`reqwest`), server-side sessions in an encrypted private cookie (`axum-extra`), SSE over a
 `tokio::sync::broadcast` channel, `rand` for dice.
 
 ## Commands
@@ -30,9 +31,33 @@ Config comes from env / `.env` (see `.env.example`): `APP_HOST`, `APP_PORT`, `DA
 (default `sqlite://./dnd.sqlite?mode=rwc`, git-ignored), `ALLOWED_ORIGIN`, `COOKIE_SECRET`.
 Cloud sessions pre-build via `.claude/hooks/session-start.sh`.
 
-Config also reads `PORT` (Cloud Run) when `APP_PORT` is unset, and `COOKIE_SECURE=true` marks the
-session cookie `Secure` (the server refuses to start with `COOKIE_SECURE=true` and no
-`COOKIE_SECRET`).
+Config also reads `PORT` (Cloud Run) when `APP_PORT` is unset, `COOKIE_SECURE=true` (marks the
+session cookie `Secure`) and `FIREBASE_PROJECT_ID`. The server refuses to start with
+`COOKIE_SECURE=true` and no `COOKIE_SECRET` or no `FIREBASE_PROJECT_ID`.
+
+## Auth model
+
+- **Production:** the browser signs in with Firebase Auth and posts the ID token to
+  `POST /api/auth/session`. `firebase.rs` verifies it (RS256, Google's JWKS cached, `aud` = project,
+  `iss`, `exp`, and `email_verified`), then the user is found by `firebase_uid`, else linked by
+  email, else created.
+- **Local dev / tests / e2e:** with no `FIREBASE_PROJECT_ID`, `POST /api/auth/dev-login {email}`
+  signs in without a password. It returns 404 when Firebase is configured. `GET /api/auth/config`
+  tells the frontend which mode is active.
+- **Sessions** (`auth.rs`): a random 32-byte token in the `__session` cookie; the `sessions` table
+  stores its SHA-256 with a 30-day sliding idle expiry (touched at most hourly) and a 90-day cap.
+  `require_user(&state.pool, &jar)` is the only way handlers learn who's calling.
+  `/logout`, `/logout-all`, `/export` (JSON of everything about the user) and `DELETE /account`
+  (cascade + Firebase user deletion via the metadata-server token) complete the set.
+
+## Abuse limits (`limits.rs`)
+
+The router built by `routes::app(state)` adds a 256 KB body limit and the `rate_limit` middleware
+(in-memory fixed windows: 300 req/min per session, 60/min per IP when signed out, 10/min for
+sign-in and for invite-code joins). Handlers enforce quotas with `ensure_quota` (characters,
+campaigns owned, members, maps, entities, notes; the feed is pruned to 5,000 events) and sizes with
+`ensure_size` / `ensure_chars`. New create endpoints need a quota, new free-text fields a cap.
+Database errors are logged and returned as a generic 500.
 
 ## Deployment (Cloud Run behind Firebase Hosting)
 
@@ -64,11 +89,14 @@ AGENTS.md) against a backend on a throwaway database.
 
 ```
 src/
-  main.rs            binary: tracing, config, pool, migrations, CORS, no-store header, serve, SIGTERM exit
-  lib.rs             module tree (tests build the router from here)
+  main.rs            binary: tracing, config, startup guards, pool, migrations, CORS, no-store header,
+                     serve (with client addresses), SIGTERM exit
+  lib.rs             module tree (tests build the app from here)
   config.rs          AppConfig::from_env
-  state/mod.rs       AppState { pool, cookie_key, config, campaign_tx } + AppState::new / notify()
-  auth.rs            password hashing, session cookie, require_user()
+  state/mod.rs       AppState { pool, cookie_key, config, campaign_tx, firebase, limiter } + new / notify()
+  auth.rs            server-side sessions (__session cookie, hashed tokens), require_user()
+  firebase.rs        FirebaseVerifier: ID token verification, Firebase user deletion
+  limits.rs          quotas, size caps, RateLimiter + rate_limit middleware
   access.rs          campaign_access() → CampaignAccess { campaign, role: Dm | Player }, require_dm()
   dice.rs            dice notation parser/roller (mirrors ../dnd/src/utils/dice.ts), unit-tested
   projection.rs      player visibility (LOS) and the player projection of an encounter, unit-tested
@@ -77,8 +105,8 @@ src/
   error.rs           ApiError → JSON { "error": "..." } (bad_request/unauthorized/forbidden/not_found/conflict)
   models/mod.rs      wire types (serde camelCase): Character, Encounter, TableState, Combat, …
   routes/
-    mod.rs           router(): campaign routers are merged under /api/campaigns
-    auth.rs          /api/auth/{register,login,logout,me}
+    mod.rs           app(state): router + body limit + rate limit; campaign routers merged under /api/campaigns
+    auth.rs          /api/auth/{config,session,dev-login,logout,logout-all,me,export,account}
     characters.rs    /api/characters[/{id}] (owner-scoped; changes notify the character's campaigns)
     notes.rs         /api/characters/{id}/notes, /api/notes/{id}
     campaigns.rs     list (role, live), create/rename/delete, members, invite, join, party sheets
@@ -109,7 +137,7 @@ tests/               common/ helpers + end-to-end tests through the real router
   calls `state.notify(campaign_id, kind)` so SSE clients refetch.
 - **Event visibility:** `public` (everyone), `private` (actor + DM), `dm` (DM only).
 - **Errors:** `ApiError::{bad_request, unauthorized, forbidden, not_found, conflict}`; `?` converts
-  sqlx/serde/argon2 errors.
+  sqlx/serde errors (sqlx errors are logged and become a generic 500).
 - **Migrations:** add a new numbered file; never edit an applied one. TEXT uuid ids, ISO-8601 TEXT
   timestamps (`models::now_iso()`), `ON DELETE CASCADE`. Foreign keys are enabled per connection
   in `db::connect`. SQLite JSON1 (`json_extract`, `json_each`) is available.
@@ -118,8 +146,10 @@ tests/               common/ helpers + end-to-end tests through the real router
 
 ## Testing
 
-Use `tests/common/mod.rs`: `test_app()` gives an in-memory app, `app.register(email)` returns a
-cookie, `app.call(method, uri, cookie, body)` returns `(StatusCode, Value)`, `app.ok(...)` asserts
+Use `tests/common/mod.rs`: `test_app()` gives an in-memory app (dev sign-in mode),
+`test_app_with(|state| …)` customizes state (e.g. a `FirebaseVerifier::with_static_keys` for token
+tests; `auth_integration.rs` generates an RSA key at runtime, never commit one),
+`app.register(email)` signs in via dev-login and returns a cookie, `app.call(method, uri, cookie, body)` returns `(StatusCode, Value)`, `app.ok(...)` asserts
 success, plus `character_json` and `corridor_encounter` fixtures. `tests/table_integration.rs`
 shows the pattern (a `Table` fixture with a DM, a player and a joined character).
 
@@ -131,8 +161,9 @@ memory connection is its own database.
 
 ## Known issues / tech debt
 
-- The session cookie value is the user id (encrypted + http-only) with no expiry or server-side
-  revocation. `COOKIE_SECRET` is padded/truncated to 64 bytes; the default secret is for dev only.
+- `COOKIE_SECRET` is padded/truncated to 64 bytes; the default secret is for dev only.
+- Rate limits are in memory, so they reset on restart (fine for a single instance). The client IP
+  comes from `X-Forwarded-For`, which only guards anonymous endpoints.
 - SSE uses one broadcast channel for all campaigns, filtered per subscriber — fine at table scale.
 - `list_campaigns` and the snapshot run several small queries; fine for a party of 6.
 
