@@ -37,6 +37,10 @@ async fn list(
 }
 
 fn validate(encounter: &Encounter) -> Result<(), ApiError> {
+    crate::limits::ensure_chars(&encounter.name, crate::limits::MAX_NAME_CHARS, "Map name")?;
+    if encounter.monsters.len() > 200 || encounter.player_tokens.len() > 50 {
+        return Err(ApiError::bad_request("Too many tokens on one map"));
+    }
     if !(1..=40).contains(&encounter.grid_cols) || !(1..=40).contains(&encounter.grid_rows) {
         return Err(ApiError::bad_request(
             "Grid must be between 1 and 40 cells per side",
@@ -71,6 +75,15 @@ async fn create(
         .await?
         .require_dm()?;
     validate(&encounter)?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encounters WHERE campaign_id = ?")
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await?;
+    crate::limits::ensure_quota(
+        count,
+        crate::limits::MAX_ENCOUNTERS_PER_CAMPAIGN,
+        "maps per campaign",
+    )?;
     if encounter.id.trim().is_empty() {
         encounter.id = uuid::Uuid::new_v4().to_string();
     }

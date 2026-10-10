@@ -10,6 +10,7 @@ use crate::{
     auth::require_user,
     db::{PayloadRow, character_from_row, deserialize_payload, merge_json, serialize_payload},
     error::ApiError,
+    limits,
     models::{Character, NewCharacter},
     state::AppState,
 };
@@ -58,7 +59,14 @@ pub async fn create(
     Json(input): Json<NewCharacter>,
 ) -> Result<(StatusCode, Json<Character>), ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM characters WHERE user_id = ?")
+        .bind(&user.id)
+        .fetch_one(&state.pool)
+        .await?;
+    limits::ensure_quota(count, limits::MAX_CHARACTERS_PER_USER, "characters")?;
     let character = input.into_character();
+    limits::ensure_chars(&character.name, limits::MAX_NAME_CHARS, "Name")?;
+    limits::ensure_size(&character, limits::MAX_CHARACTER_BYTES, "Character")?;
     let payload = serialize_payload(&character)?;
 
     sqlx::query(
@@ -96,6 +104,8 @@ pub async fn update(
     updated.id = current.id;
     updated.created_at = current.created_at;
     updated.updated_at = crate::models::now_iso();
+    limits::ensure_chars(&updated.name, limits::MAX_NAME_CHARS, "Name")?;
+    limits::ensure_size(&updated, limits::MAX_CHARACTER_BYTES, "Character")?;
 
     sqlx::query("UPDATE characters SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?")
         .bind(serialize_payload(&updated)?)

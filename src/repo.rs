@@ -266,6 +266,17 @@ pub async fn record_event(
     .bind(&record.created_at)
     .execute(&state.pool)
     .await?;
+    // Keep the feed bounded: drop the oldest events beyond the cap.
+    sqlx::query(
+        "DELETE FROM campaign_events WHERE campaign_id = ? AND rowid <= (
+             SELECT rowid FROM campaign_events WHERE campaign_id = ? ORDER BY rowid DESC LIMIT 1 OFFSET ?
+         )",
+    )
+    .bind(campaign_id)
+    .bind(campaign_id)
+    .bind(crate::limits::MAX_EVENTS_PER_CAMPAIGN)
+    .execute(&state.pool)
+    .await?;
     Ok(record)
 }
 

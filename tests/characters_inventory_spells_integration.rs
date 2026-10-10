@@ -37,7 +37,7 @@ async fn test_app() -> (Router, SqlitePool) {
         },
     );
 
-    (routes::router().with_state(state), pool)
+    (routes::app(state), pool)
 }
 
 async fn response_json(response: axum::response::Response) -> Value {

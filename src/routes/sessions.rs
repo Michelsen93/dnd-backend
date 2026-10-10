@@ -174,6 +174,11 @@ async fn end(
 
     session.ended_at = Some(now_iso());
     merge_object(&mut session.log, log);
+    crate::limits::ensure_size(
+        &session.log,
+        crate::limits::MAX_SESSION_LOG_BYTES,
+        "Session log",
+    )?;
     sqlx::query("UPDATE game_sessions SET ended_at = ?, payload = ? WHERE id = ?")
         .bind(&session.ended_at)
         .bind(serde_json::to_string(&session.log)?)
@@ -207,6 +212,11 @@ async fn update_log(
         return Err(ApiError::bad_request("Session log must be a JSON object"));
     }
     merge_object(&mut session.log, log);
+    crate::limits::ensure_size(
+        &session.log,
+        crate::limits::MAX_SESSION_LOG_BYTES,
+        "Session log",
+    )?;
     sqlx::query("UPDATE game_sessions SET payload = ? WHERE id = ?")
         .bind(serde_json::to_string(&session.log)?)
         .bind(&session.id)

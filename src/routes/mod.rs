@@ -1,6 +1,6 @@
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, extract::DefaultBodyLimit, middleware, routing::get};
 
-use crate::{models::HealthResponse, state::AppState};
+use crate::{limits, models::HealthResponse, state::AppState};
 
 pub mod auth;
 pub mod campaigns;
@@ -10,6 +10,17 @@ pub mod entities;
 pub mod notes;
 pub mod sessions;
 pub mod table;
+
+/// The complete application: routes plus rate limiting and body size limits.
+pub fn app(state: AppState) -> Router {
+    router()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limits::rate_limit,
+        ))
+        .layer(DefaultBodyLimit::max(limits::MAX_BODY_BYTES))
+        .with_state(state)
+}
 
 pub fn router() -> Router<AppState> {
     let campaigns = campaigns::router()

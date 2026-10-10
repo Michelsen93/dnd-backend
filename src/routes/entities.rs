@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use sqlx::{FromRow, SqlitePool};
 
 use crate::{
-    access::campaign_access, auth::require_user, error::ApiError, models::now_iso, repo,
+    access::campaign_access, auth::require_user, error::ApiError, limits, models::now_iso, repo,
     state::AppState,
 };
 
@@ -145,6 +145,17 @@ async fn create(
     if !input.data.is_object() {
         return Err(ApiError::bad_request("data must be a JSON object"));
     }
+    limits::ensure_size(&input.data, limits::MAX_ENTITY_BYTES, "Entry")?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM campaign_entities WHERE campaign_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await?;
+    limits::ensure_quota(
+        count,
+        limits::MAX_ENTITIES_PER_CAMPAIGN,
+        "story entries per campaign",
+    )?;
     let now = now_iso();
     let record = EntityRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -204,6 +215,7 @@ async fn update(
         map.extend(patch);
     }
     record.updated_at = now_iso();
+    limits::ensure_size(&record.data, limits::MAX_ENTITY_BYTES, "Entry")?;
     sqlx::query(
         "UPDATE campaign_entities SET revealed = ?, payload = ?, updated_at = ? WHERE id = ?",
     )

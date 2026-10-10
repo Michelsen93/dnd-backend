@@ -36,7 +36,7 @@ async fn test_app() -> Router {
         },
     );
 
-    routes::router().with_state(state)
+    routes::app(state)
 }
 
 async fn response_json(response: axum::response::Response) -> Value {

@@ -20,6 +20,7 @@ use crate::{
     db::UserRow,
     dice::{self, Advantage},
     error::ApiError,
+    limits,
     models::{Combat, Combatant, Encounter, Spotlight, TableState},
     projection::{self, project_encounter_for_player},
     repo::{self, EventRecord},
@@ -219,6 +220,7 @@ async fn post_note(
     let user = require_user(&state.pool, &jar).await?;
     let access = campaign_access(&state.pool, &id, &user.id).await?;
     let text = input.text.trim();
+    limits::ensure_chars(text, limits::MAX_FEED_TEXT_CHARS, "Message")?;
     if text.is_empty() {
         return Err(ApiError::bad_request("Note text is required"));
     }
@@ -314,6 +316,10 @@ async fn roll(
             .map(str::to_string);
     }
 
+    limits::ensure_chars(&input.label, limits::MAX_LABEL_CHARS, "Roll label")?;
+    if let Some(meta) = &input.meta {
+        limits::ensure_size(meta, 2048, "Roll details")?;
+    }
     let advantage = Advantage::parse(input.advantage.as_deref());
     let result = dice::roll(&input.notation, advantage).map_err(ApiError::bad_request)?;
     let roll_kind = input
@@ -507,6 +513,33 @@ enum Action {
     EndTurn,
 }
 
+fn validate_action(action: &Action) -> Result<(), ApiError> {
+    match action {
+        Action::Spotlight { title, body, .. } => {
+            limits::ensure_chars(title, limits::MAX_LABEL_CHARS, "Title")?;
+            limits::ensure_chars(body, limits::MAX_SPOTLIGHT_BODY_CHARS, "Text")
+        }
+        Action::RequestRoll {
+            label,
+            character_ids,
+            ..
+        } => {
+            limits::ensure_chars(label, limits::MAX_LABEL_CHARS, "Label")?;
+            if character_ids.len() > limits::MAX_MEMBERS_PER_CAMPAIGN as usize {
+                return Err(ApiError::bad_request("Too many characters"));
+            }
+            Ok(())
+        }
+        Action::AwardXp { amount, .. } if !(0..=1_000_000).contains(amount) => {
+            Err(ApiError::bad_request("XP must be between 0 and 1,000,000"))
+        }
+        Action::ApplyDamage { amount, .. } if amount.abs() > 10_000 => Err(ApiError::bad_request(
+            "That's a lot of damage — at most 10,000",
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActionResponse {
@@ -529,6 +562,7 @@ async fn action(
         access: &access,
     };
 
+    validate_action(&action)?;
     let event = match action {
         Action::MoveToken { token_id, x, y } => ctx.move_token(&token_id, x, y).await?,
         Action::EndTurn => ctx.end_turn().await?,

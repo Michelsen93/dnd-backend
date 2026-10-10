@@ -46,15 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Method::OPTIONS,
         ]);
 
-    let app: Router = routes::router()
+    let app: Router = routes::app(shared_state)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         // API responses are per-user; never let a CDN (Firebase Hosting) cache them.
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
-        ))
-        .with_state(shared_state);
+        ));
 
     let listener = tokio::net::TcpListener::bind(config.bind_address()).await?;
     tracing::info!(address = %listener.local_addr()?, "backend listening");
@@ -62,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // own, and in the container Litestream needs the server gone to run its final sync before
     // Cloud Run's 10 s shutdown deadline.
     tokio::select! {
-        result = axum::serve(listener, app) => result?,
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result?,
         _ = shutdown_signal() => tracing::info!("shutdown signal received, exiting"),
     }
     Ok(())

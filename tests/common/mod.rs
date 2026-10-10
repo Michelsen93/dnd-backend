@@ -41,7 +41,7 @@ pub async fn test_app_with(customize: impl FnOnce(AppState) -> AppState) -> Test
     };
     let state = customize(AppState::new(pool.clone(), Key::from(&[7_u8; 64]), config));
     TestApp {
-        router: routes::router().with_state(state),
+        router: routes::app(state),
         pool,
     }
 }

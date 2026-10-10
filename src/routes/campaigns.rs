@@ -13,7 +13,7 @@ use crate::{
     access::{CampaignRole, campaign_access},
     auth::require_user,
     error::ApiError,
-    repo,
+    limits, repo,
     state::AppState,
 };
 
@@ -188,6 +188,12 @@ async fn create_campaign(
     if name.is_empty() {
         return Err(ApiError::bad_request("Campaign name is required"));
     }
+    limits::ensure_chars(name, limits::MAX_NAME_CHARS, "Campaign name")?;
+    let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM campaigns WHERE owner_user_id = ?")
+        .bind(&user.id)
+        .fetch_one(&state.pool)
+        .await?;
+    limits::ensure_quota(owned, limits::MAX_CAMPAIGNS_OWNED, "campaigns you run")?;
     let now = crate::models::now_iso();
     let row = CampaignRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -226,6 +232,7 @@ async fn rename_campaign(
     if name.is_empty() {
         return Err(ApiError::bad_request("Campaign name is required"));
     }
+    limits::ensure_chars(name, limits::MAX_NAME_CHARS, "Campaign name")?;
     sqlx::query("UPDATE campaigns SET name = ?, updated_at = ? WHERE id = ?")
         .bind(name)
         .bind(crate::models::now_iso())
@@ -411,6 +418,18 @@ async fn insert_member(
     user_id: &str,
     character: CharacterPayload,
 ) -> Result<CampaignMemberRecord, ApiError> {
+    let members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM campaign_members WHERE campaign_id = ? AND character_id != ?",
+    )
+    .bind(campaign_id)
+    .bind(&character.id)
+    .fetch_one(&state.pool)
+    .await?;
+    limits::ensure_quota(
+        members,
+        limits::MAX_MEMBERS_PER_CAMPAIGN,
+        "characters in a campaign",
+    )?;
     sqlx::query(
         "INSERT OR IGNORE INTO campaign_members (id, campaign_id, user_id, character_id, character_name, sprite_key, joined_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
