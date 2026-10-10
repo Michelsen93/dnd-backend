@@ -9,7 +9,8 @@ use sqlx::SqlitePool;
 use crate::db::UserRow;
 use crate::error::ApiError;
 
-pub const SESSION_COOKIE_NAME: &str = "dnd_session";
+/// Firebase Hosting forwards only the cookie named `__session` to Cloud Run, so that's our name.
+pub const SESSION_COOKIE_NAME: &str = "__session";
 
 pub fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
@@ -24,8 +25,9 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, ApiError> {
         .is_ok())
 }
 
-pub fn add_session_cookie(jar: PrivateCookieJar, user_id: &str) -> PrivateCookieJar {
+pub fn add_session_cookie(jar: PrivateCookieJar, user_id: &str, secure: bool) -> PrivateCookieJar {
     let mut cookie = Cookie::new(SESSION_COOKIE_NAME, user_id.to_string());
+    cookie.set_secure(secure);
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_path("/");

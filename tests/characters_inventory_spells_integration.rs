@@ -32,6 +32,7 @@ async fn test_app() -> (Router, SqlitePool) {
             database_url: "sqlite::memory:".to_string(),
             allowed_origin: "http://localhost:5173".to_string(),
             cookie_secret: "characters-integration-tests-key-seed".to_string(),
+            cookie_secure: false,
         },
     );
 

@@ -30,6 +30,33 @@ Config comes from env / `.env` (see `.env.example`): `APP_HOST`, `APP_PORT`, `DA
 (default `sqlite://./dnd.sqlite?mode=rwc`, git-ignored), `ALLOWED_ORIGIN`, `COOKIE_SECRET`.
 Cloud sessions pre-build via `.claude/hooks/session-start.sh`.
 
+Config also reads `PORT` (Cloud Run) when `APP_PORT` is unset, and `COOKIE_SECURE=true` marks the
+session cookie `Secure` (the server refuses to start with `COOKIE_SECURE=true` and no
+`COOKIE_SECRET`).
+
+## Deployment (Cloud Run behind Firebase Hosting)
+
+Production runs this crate as a container on Cloud Run, reached through Firebase Hosting rewrites
+on the same domain. The deploy script and guide live in the frontend repo
+(`../dnd/deploy/deploy.sh`, `../dnd/docs/DEPLOY.md`).
+
+- `Dockerfile`: multi-stage build (`rust:1.95-bookworm` → `debian:bookworm-slim`), no apt; ships
+  the binary, Litestream and CA roots. `docker-entrypoint.sh` restores the SQLite file from
+  `LITESTREAM_REPLICA_URL` (e.g. `gcs://bucket/dnd.sqlite`) on boot, then runs the server under
+  `litestream replicate -exec`, which streams every change back to Cloud Storage.
+- **Exactly one instance** (`--max-instances 1`): SQLite and the in-process broadcast channel for
+  SSE don't work across instances. Don't add features that assume horizontal scaling.
+- The server exits immediately on SIGTERM (no draining: SSE streams never end) so Litestream can
+  run its final sync within Cloud Run's 10 s shutdown window.
+- The session cookie is named `__session` because Firebase Hosting forwards only that cookie.
+- Every response gets `Cache-Control: no-store` (unless a handler sets one) so the Hosting CDN
+  never caches per-user data.
+- SSE sends a named `ping` event on connect and every 10 s (with `retry: 1500`). Clients use the
+  pings to detect a buffering proxy and fall back to polling; keep them.
+- Test the image locally: `docker build -t pixel-quest-api .` then run it with
+  `LITESTREAM_REPLICA_URL=file:///replica/dnd.sqlite` and a mounted folder; stop/start and the
+  data must come back.
+
 For end-to-end checks run the frontend playtest (`npm run playtest` in `../dnd`, see its
 AGENTS.md) against a backend on a throwaway database.
 
@@ -37,7 +64,7 @@ AGENTS.md) against a backend on a throwaway database.
 
 ```
 src/
-  main.rs            binary: tracing, config, pool, migrations, CORS, serve (uses the lib crate)
+  main.rs            binary: tracing, config, pool, migrations, CORS, no-store header, serve, SIGTERM exit
   lib.rs             module tree (tests build the router from here)
   config.rs          AppConfig::from_env
   state/mod.rs       AppState { pool, cookie_key, config, campaign_tx } + AppState::new / notify()
@@ -60,6 +87,7 @@ src/
     sessions.rs      /{id}/sessions — start, end (publish log), edit log
     table.rs         /{id}/table (snapshot), /stream (SSE), /events, /rolls, /actions
 migrations/          000N_name.sql, applied by sqlx::migrate! at startup and in tests
+Dockerfile           production image (server + Litestream); docker-entrypoint.sh restores/replicates
 tests/               common/ helpers + end-to-end tests through the real router
 ```
 

@@ -72,7 +72,7 @@ pub async fn register(
     Ok((
         StatusCode::CREATED,
         (
-            add_session_cookie(jar, &user_id),
+            add_session_cookie(jar, &user_id, state.config.cookie_secure),
             Json(AuthResponse { user }),
         ),
     ))
@@ -97,7 +97,7 @@ pub async fn login(
     }
 
     Ok((
-        add_session_cookie(jar, &user.id),
+        add_session_cookie(jar, &user.id, state.config.cookie_secure),
         Json(AuthResponse {
             user: UserResponse {
                 id: user.id,

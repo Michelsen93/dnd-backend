@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, Sse},
     routing::{get, post},
 };
 use axum_extra::extract::PrivateCookieJar;
@@ -148,7 +148,7 @@ async fn stream(
     campaign_access(&state.pool, &id, &user.id).await?;
     let rx = state.campaign_tx.subscribe();
 
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
+    let updates = BroadcastStream::new(rx).filter_map(move |msg| match msg {
         Ok(signal) if signal.campaign_id == id => {
             Some(Ok(Event::default().event("update").data(signal.kind)))
         }
@@ -157,11 +157,18 @@ async fn stream(
         _ => None,
     });
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    // A named `ping` every 10 s (not an SSE comment) lets clients detect proxies that buffer the
+    // stream, e.g. Firebase Hosting, and fall back to polling. `retry` makes reconnects quick
+    // when a proxy cuts the connection (Hosting closes requests after 60 s).
+    let hello = tokio_stream::once(Ok(Event::default()
+        .event("ping")
+        .data("hello")
+        .retry(Duration::from_millis(1500))));
+    let pings =
+        tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(10)))
+            .map(|_| Ok(Event::default().event("ping").data("ping")));
+
+    Ok(Sse::new(hello.chain(updates.merge(pings))))
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────

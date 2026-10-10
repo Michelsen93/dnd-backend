@@ -31,6 +31,7 @@ pub async fn test_app() -> TestApp {
         database_url: "sqlite::memory:".into(),
         allowed_origin: "http://localhost:5173".into(),
         cookie_secret: "test".into(),
+        cookie_secure: false,
     };
     let state = AppState::new(pool.clone(), Key::from(&[7_u8; 64]), config);
     TestApp {
