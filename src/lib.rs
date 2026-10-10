@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod dice;
 pub mod error;
+pub mod firebase;
 pub mod models;
 pub mod projection;
 pub mod repo;

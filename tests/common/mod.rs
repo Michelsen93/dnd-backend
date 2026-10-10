@@ -18,6 +18,11 @@ pub struct TestApp {
 }
 
 pub async fn test_app() -> TestApp {
+    test_app_with(|state| state).await
+}
+
+/// Like `test_app`, with a hook to adjust the state (e.g. install a Firebase verifier).
+pub async fn test_app_with(customize: impl FnOnce(AppState) -> AppState) -> TestApp {
     let pool = db::connect("sqlite::memory:")
         .await
         .expect("connect sqlite");
@@ -32,8 +37,9 @@ pub async fn test_app() -> TestApp {
         allowed_origin: "http://localhost:5173".into(),
         cookie_secret: "test".into(),
         cookie_secure: false,
+        firebase_project_id: None,
     };
-    let state = AppState::new(pool.clone(), Key::from(&[7_u8; 64]), config);
+    let state = customize(AppState::new(pool.clone(), Key::from(&[7_u8; 64]), config));
     TestApp {
         router: routes::router().with_state(state),
         pool,
@@ -86,6 +92,43 @@ impl TestApp {
         value
     }
 
+    /// Like `call`, but also returns the `name=value` part of a Set-Cookie header if any.
+    pub async fn call_with_cookie(
+        &self,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value, Option<String>) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = self
+            .router
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(str::to_string);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value, set_cookie)
+    }
+
     pub async fn register(&self, email: &str) -> String {
         let response = self
             .router
@@ -93,16 +136,14 @@ impl TestApp {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/auth/register")
+                    .uri("/api/auth/dev-login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "email": email, "password": "supersecure-password" }).to_string(),
-                    ))
+                    .body(Body::from(json!({ "email": email }).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
         response
             .headers()
             .get(header::SET_COOKIE)

@@ -14,7 +14,7 @@ use crate::models::Character;
 pub struct UserRow {
     pub id: String,
     pub email: String,
-    pub password_hash: String,
+    pub firebase_uid: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

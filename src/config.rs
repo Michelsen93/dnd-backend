@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub cookie_secret: String,
     /// Mark the session cookie `Secure` (required when served over HTTPS in production).
     pub cookie_secure: bool,
+    /// Set in production: sign-in goes through Firebase Authentication. Unset: local dev login.
+    pub firebase_project_id: Option<String>,
 }
 
 impl AppConfig {
@@ -28,6 +30,9 @@ impl AppConfig {
             cookie_secret: env::var("COOKIE_SECRET")
                 .unwrap_or_else(|_| "dev-cookie-secret-dev-cookie-secret".to_string()),
             cookie_secure: env::var("COOKIE_SECURE").is_ok_and(|v| v == "true" || v == "1"),
+            firebase_project_id: env::var("FIREBASE_PROJECT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 

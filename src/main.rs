@@ -21,6 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.cookie_secure && std::env::var("COOKIE_SECRET").is_err() {
         return Err("COOKIE_SECRET must be set in production (COOKIE_SECURE=true)".into());
     }
+    if config.cookie_secure && config.firebase_project_id.is_none() {
+        // Without Firebase the passwordless dev login would be open to the internet.
+        return Err("FIREBASE_PROJECT_ID must be set in production (COOKIE_SECURE=true)".into());
+    }
     let pool = db::connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     let shared_state = AppState::new(

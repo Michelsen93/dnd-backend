@@ -59,18 +59,17 @@ impl IntoResponse for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        // Log the details; never send database internals to the browser.
+        tracing::error!(%error, "database error");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side. Try again.",
+        )
     }
 }
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::bad_request(error.to_string())
-    }
-}
-
-impl From<argon2::password_hash::Error> for ApiError {
-    fn from(error: argon2::password_hash::Error) -> Self {
         Self::bad_request(error.to_string())
     }
 }

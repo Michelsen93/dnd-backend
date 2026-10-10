@@ -23,12 +23,6 @@ pub struct AuthResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Credentials {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AbilityKey {
     #[serde(rename = "str")]

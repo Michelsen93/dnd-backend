@@ -33,6 +33,7 @@ async fn test_app() -> (Router, SqlitePool) {
             allowed_origin: "http://localhost:5173".to_string(),
             cookie_secret: "characters-integration-tests-key-seed".to_string(),
             cookie_secure: false,
+            firebase_project_id: None,
         },
     );
 
@@ -65,12 +66,11 @@ async fn register_and_get_cookie(app: &Router, email: &str) -> String {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/register")
+                .uri("/api/auth/dev-login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
-                        "email": email,
-                        "password": "supersecure-password"
+                        "email": email
                     })
                     .to_string(),
                 ))
@@ -79,7 +79,7 @@ async fn register_and_get_cookie(app: &Router, email: &str) -> String {
         .await
         .expect("register request");
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     first_cookie(&response)
 }
 
