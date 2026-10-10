@@ -136,15 +136,28 @@ pub async fn rate_limit(State(state): State<AppState>, request: Request, next: N
     let ip = client_ip(&request);
     let session = session_cookie(&request);
 
+    // A paired TV screen carries its token in the path: limit it like a signed-in user.
+    let screen_token = path
+        .strip_prefix("/api/screen/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|token| *token != "pair" && !token.is_empty());
+
     let mut checks: Vec<(String, u32)> = Vec::with_capacity(2);
-    match &session {
-        Some(cookie) => checks.push((
+    match (&session, screen_token) {
+        (_, Some(token)) => checks.push((
+            format!("screen:{}", crate::auth::hash_token(token)),
+            SIGNED_IN_PER_MINUTE,
+        )),
+        (Some(cookie), None) => checks.push((
             format!("s:{}", crate::auth::hash_token(cookie)),
             SIGNED_IN_PER_MINUTE,
         )),
-        None => checks.push((format!("ip:{ip}"), ANONYMOUS_PER_MINUTE)),
+        (None, None) => checks.push((format!("ip:{ip}"), ANONYMOUS_PER_MINUTE)),
     }
-    if path.ends_with("/auth/session") || path.ends_with("/auth/dev-login") {
+    if path.ends_with("/auth/session")
+        || path.ends_with("/auth/dev-login")
+        || path == "/api/screen/pair"
+    {
         checks.push((format!("signin:{ip}"), SIGN_IN_PER_MINUTE));
     }
     if path.ends_with("/campaigns/join") {

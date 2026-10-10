@@ -8,6 +8,7 @@ pub mod characters;
 pub mod encounters;
 pub mod entities;
 pub mod notes;
+pub mod screen;
 pub mod sessions;
 pub mod table;
 
@@ -27,7 +28,8 @@ pub fn router() -> Router<AppState> {
         .merge(encounters::router())
         .merge(entities::router())
         .merge(sessions::router())
-        .merge(table::router());
+        .merge(table::router())
+        .merge(screen::campaign_router());
 
     Router::new()
         .route("/health", get(health))
@@ -51,6 +53,7 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(notes::update).delete(notes::delete_note),
         )
         .nest("/api/campaigns", campaigns)
+        .nest("/api/screen", screen::router())
 }
 
 async fn health() -> Json<HealthResponse> {

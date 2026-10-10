@@ -54,7 +54,7 @@ session cookie `Secure`) and `FIREBASE_PROJECT_ID`. The server refuses to start 
 
 The router built by `routes::app(state)` adds a 256 KB body limit and the `rate_limit` middleware
 (in-memory fixed windows: 300 req/min per session, 60/min per IP when signed out, 10/min for
-sign-in and for invite-code joins). Handlers enforce quotas with `ensure_quota` (characters,
+sign-in, TV pairing and invite-code joins; a TV screen's token counts like a session). Handlers enforce quotas with `ensure_quota` (characters,
 campaigns owned, members, maps, entities, notes; the feed is pruned to 5,000 events) and sizes with
 `ensure_size` / `ensure_chars`. New create endpoints need a quota, new free-text fields a cap.
 Database errors are logged and returned as a generic 500.
@@ -113,7 +113,8 @@ src/
     encounters.rs    /{id}/encounters — DM map CRUD with optimistic concurrency (revision → 409)
     entities.rs      /{id}/entities — quests/NPCs/places/handouts/loot, reveal, claim loot
     sessions.rs      /{id}/sessions — start, end (publish log), edit log
-    table.rs         /{id}/table (snapshot), /stream (SSE), /events, /rolls, /actions
+    table.rs         /{id}/table (snapshot), /stream (SSE), /events, /rolls (targets → hit/miss), /actions
+    screen.rs        TV screens: DM /{id}/screens (pairing codes); /api/screen/{pair, {token}/table, {token}/stream}
 migrations/          000N_name.sql, applied by sqlx::migrate! at startup and in tests
 Dockerfile           production image (server + Litestream); docker-entrypoint.sh restores/replicates
 tests/               common/ helpers + end-to-end tests through the real router
@@ -131,7 +132,8 @@ tests/               common/ helpers + end-to-end tests through the real router
 - **Hidden information is enforced here.** Players get `project_encounter_for_player` (no unseen
   monsters, no HP/AC, `fog` terrain), unseen monsters are removed from combat, events about them
   are `dm` visibility, hidden DCs are stripped, `dmNotes` are stripped, unrevealed entities are
-  filtered. Any new DM-only data needs the same treatment **and a test**.
+  filtered. Paired TV screens get the same party view (`screen.rs`) with public events only. Any
+  new DM-only data needs the same treatment **and a test**.
 - **Shared state changes go through commands**, not blob PATCHes: add an `Action` variant in
   `routes/table.rs`, record an event with `Ctx::event(kind, visibility, payload)`, and the handler
   calls `state.notify(campaign_id, kind)` so SSE clients refetch.
@@ -164,6 +166,8 @@ memory connection is its own database.
 - `COOKIE_SECRET` is padded/truncated to 64 bytes; the default secret is for dev only.
 - Rate limits are in memory, so they reset on restart (fine for a single instance). The client IP
   comes from `X-Forwarded-For`, which only guards anonymous endpoints.
+- TV screen tokens travel in the URL path (EventSource can't send headers), so they appear in
+  request logs. They are read-only, revocable by the DM and expire after 30 idle days.
 - SSE uses one broadcast channel for all campaigns, filtered per subscriber — fine at table scale.
 - `list_campaigns` and the snapshot run several small queries; fine for a party of 6.
 
