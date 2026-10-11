@@ -140,6 +140,11 @@ pub async fn save_character_value(
     if let Value::Object(map) = value {
         map.insert("updatedAt".into(), Value::String(now.clone()));
     }
+    // Every write path (DM edits, damage, XP, loot) must leave a sheet that still loads; a bad
+    // value would otherwise lock its owner out of their character list.
+    crate::limits::ensure_size(value, crate::limits::MAX_CHARACTER_BYTES, "Character")?;
+    serde_json::from_value::<crate::models::Character>(value.clone())
+        .map_err(|_| ApiError::bad_request("That change would break the character sheet"))?;
     sqlx::query("UPDATE characters SET payload = ?, updated_at = ? WHERE id = ?")
         .bind(serde_json::to_string(value)?)
         .bind(&now)

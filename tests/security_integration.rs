@@ -245,3 +245,203 @@ async fn one_user_cannot_hold_every_stream() {
         "closing frees the slots"
     );
 }
+
+#[tokio::test]
+async fn invite_codes_are_long_and_random() {
+    let t = table().await;
+    let campaign = t.app.ok("GET", "/api/campaigns", &t.dm, None).await;
+    let code = campaign["campaigns"][0]["inviteCode"].as_str().unwrap();
+    assert_eq!(code.len(), 12);
+    assert!(
+        code.bytes()
+            .all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b))
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_character_leaves_and_never_shows_an_email() {
+    let t = table().await;
+    t.app
+        .ok(
+            "DELETE",
+            &format!("/api/characters/{}", t.character_id),
+            &t.player,
+            None,
+        )
+        .await;
+    let party = t.app.ok("GET", &t.url("/characters"), &t.dm, None).await;
+    assert_eq!(
+        party.as_array().unwrap().len(),
+        0,
+        "the membership went with the character"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM campaign_members")
+        .fetch_one(&t.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(members, 0);
+}
+
+#[tokio::test]
+async fn the_dm_cannot_break_a_players_sheet() {
+    let t = table().await;
+    let (status, _) = t
+        .app
+        .call(
+            "PATCH",
+            &t.url(&format!("/characters/{}", t.character_id)),
+            Some(&t.dm),
+            Some(json!({ "hitPointsCurrent": "lol" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mine = t.app.ok("GET", "/api/characters", &t.player, None).await;
+    assert_eq!(
+        mine.as_array().unwrap().len(),
+        1,
+        "the player's list still loads"
+    );
+    // XP can't be pushed past what the sheet can hold.
+    for _ in 0..3 {
+        t.app
+            .ok(
+                "POST",
+                &t.url("/actions"),
+                &t.dm,
+                Some(json!({ "type": "award_xp", "amount": 1_000_000, "characterIds": [t.character_id] })),
+            )
+            .await;
+    }
+    let sheet = t
+        .app
+        .ok(
+            "GET",
+            &format!("/api/characters/{}", t.character_id),
+            &t.player,
+            None,
+        )
+        .await;
+    assert!(sheet["experiencePoints"].as_i64().unwrap() <= 10_000_000);
+}
+
+#[tokio::test]
+async fn players_cannot_probe_the_fog_or_a_monsters_ac() {
+    let t = table().await;
+    let snapshot = t.app.ok("GET", &t.url("/table"), &t.player, None).await;
+    let token = snapshot["encounter"]["playerTokens"][0]["id"].clone();
+    // x=4 is behind the wall: the answer is the same whether it's empty, a wall or the orc.
+    let (status, body) = t
+        .app
+        .call(
+            "POST",
+            &t.url("/actions"),
+            Some(&t.player),
+            Some(json!({ "type": "move_token", "tokenId": token, "x": 4, "y": 0 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("can see"));
+    let (status, _) = t
+        .app
+        .call(
+            "POST",
+            &t.url("/rolls"),
+            Some(&t.player),
+            Some(json!({ "notation": "15", "label": "probe", "characterId": t.character_id, "rollKind": "attack",
+                         "target": { "kind": "monster", "id": "gob" }, "secret": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "attacks need a d20");
+}
+
+#[tokio::test]
+async fn loot_can_only_be_claimed_once() {
+    let t = table().await;
+    let loot = t
+        .app
+        .ok(
+            "POST",
+            &t.url("/entities"),
+            &t.dm,
+            Some(json!({ "kind": "loot", "revealed": true, "data": { "name": "Potion", "quantity": 99999999999i64 } })),
+        )
+        .await;
+    let claim_url = t.url(&format!("/entities/{}/claim", loot["id"].as_str().unwrap()));
+    let claim_body = json!({ "characterId": t.character_id });
+    let claim = || {
+        t.app.call(
+            "POST",
+            &claim_url,
+            Some(&t.player),
+            Some(claim_body.clone()),
+        )
+    };
+    let (first, second) = tokio::join!(claim(), claim());
+    let statuses = [first.0, second.0];
+    assert_eq!(
+        statuses.iter().filter(|s| s.is_success()).count(),
+        1,
+        "{statuses:?}"
+    );
+    let sheet = t
+        .app
+        .ok(
+            "GET",
+            &format!("/api/characters/{}", t.character_id),
+            &t.player,
+            None,
+        )
+        .await;
+    let potions: Vec<&Value> = sheet["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["name"] == "Potion")
+        .collect();
+    assert_eq!(potions.len(), 1);
+    assert!(potions[0]["quantity"].as_i64().unwrap() <= 9_999);
+}
+
+#[tokio::test]
+async fn made_up_cookies_share_the_anonymous_limit() {
+    let app = test_app().await;
+    let mut limited = 0;
+    for i in 0..80 {
+        let cookie = format!("__session=forged{i}");
+        let (status, _) = app.call("GET", "/api/auth/me", Some(&cookie), None).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    assert!(
+        limited > 0,
+        "a fresh fake cookie per request no longer buys a fresh bucket"
+    );
+}
+
+#[tokio::test]
+async fn sessions_per_user_are_capped() {
+    let app = test_app().await;
+    app.register("many@example.com").await;
+    // 30 older sessions for the same account (signing in 30 times would hit the rate limit).
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+         INSERT INTO sessions (id_hash, user_id, created_at, last_seen_at, expires_at)
+         SELECT 'old' || i, (SELECT id FROM users), i, i, 9999999999 FROM n",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    app.register("many@example.com").await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, backend::auth::MAX_SESSIONS_PER_USER);
+    let newest_kept: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id_hash = 'old1'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(newest_kept, 0, "the oldest sessions go first");
+}

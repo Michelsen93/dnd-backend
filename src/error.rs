@@ -74,6 +74,8 @@ impl From<sqlx::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::bad_request(error.to_string())
+        // The parser's message can quote internals (field names, stored data); keep it in logs.
+        tracing::info!(%error, "rejected malformed data");
+        Self::bad_request("That data isn't in the expected shape")
     }
 }

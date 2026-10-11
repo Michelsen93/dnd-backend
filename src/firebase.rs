@@ -51,7 +51,12 @@ struct JwkSet {
 struct KeyCache {
     keys: HashMap<String, DecodingKey>,
     expires_at: Instant,
+    /// When Google's keys were last fetched: an unknown `kid` triggers at most one refetch a
+    /// minute, so made-up tokens can't turn us into a request amplifier.
+    fetched_at: Option<Instant>,
 }
+
+const MIN_REFETCH: Duration = Duration::from_secs(60);
 
 pub struct FirebaseVerifier {
     project_id: String,
@@ -72,6 +77,7 @@ impl FirebaseVerifier {
             cache: RwLock::new(KeyCache {
                 keys: HashMap::new(),
                 expires_at: Instant::now(),
+                fetched_at: None,
             }),
             fetch_keys: true,
         }
@@ -87,6 +93,7 @@ impl FirebaseVerifier {
         verifier.cache = RwLock::new(KeyCache {
             keys,
             expires_at: Instant::now() + Duration::from_secs(365 * 24 * 3600),
+            fetched_at: None,
         });
         verifier
     }
@@ -142,6 +149,13 @@ impl FirebaseVerifier {
                     return Ok(None);
                 }
             }
+            if cache.expires_at > Instant::now()
+                && cache
+                    .fetched_at
+                    .is_some_and(|at| at.elapsed() < MIN_REFETCH)
+            {
+                return Ok(None);
+            }
         }
         self.refresh_keys().await?;
         Ok(self.cache.read().await.keys.get(kid).cloned())
@@ -168,6 +182,7 @@ impl FirebaseVerifier {
         *self.cache.write().await = KeyCache {
             keys,
             expires_at: Instant::now() + Duration::from_secs(max_age),
+            fetched_at: Some(Instant::now()),
         };
         Ok(())
     }

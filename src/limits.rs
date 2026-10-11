@@ -156,84 +156,124 @@ impl RateLimiter {
     pub fn hit(&self, key: &str, limit: u32, window_secs: i64) -> Result<(), i64> {
         let now = chrono::Utc::now().timestamp();
         let window = now / window_secs;
+        let retry = window_secs - now % window_secs;
         let mut windows = self.windows.lock().expect("rate limiter lock");
-        if windows.len() > 50_000 {
+        if windows.len() >= MAX_TRACKED_KEYS && !windows.contains_key(key) {
+            // Drop stale windows once; if a flood still fills the map, refuse new keys rather
+            // than grow without bound (existing clients keep working).
             windows.retain(|_, (w, _)| *w == window);
+            if windows.len() >= MAX_TRACKED_KEYS {
+                return Err(retry);
+            }
         }
         let entry = windows.entry(key.to_string()).or_insert((window, 0));
         if entry.0 != window {
             *entry = (window, 0);
         }
         entry.1 += 1;
-        if entry.1 > limit {
-            Err(window_secs - now % window_secs)
-        } else {
-            Ok(())
-        }
+        if entry.1 > limit { Err(retry) } else { Ok(()) }
     }
 }
 
+const MAX_TRACKED_KEYS: usize = 100_000;
+
 /// Requests per minute.
 const SIGNED_IN_PER_MINUTE: u32 = 300;
+/// Backstops across all clients, for traffic whose per-client key can be faked (IP headers).
+const ALL_ANONYMOUS_PER_MINUTE: u32 = 1_200;
+const ALL_SIGN_IN_PER_MINUTE: u32 = 120;
+const ALL_JOIN_PER_MINUTE: u32 = 300;
+const ALL_SCREENS_PER_MINUTE: u32 = 3_000;
 const ANONYMOUS_PER_MINUTE: u32 = 60;
 const SIGN_IN_PER_MINUTE: u32 = 10;
 const JOIN_PER_MINUTE: u32 = 10;
 
+/// How many proxies in front of us append to X-Forwarded-For (`TRUSTED_PROXY_HOPS`). When set,
+/// the client's address is that many entries from the right; anything further left was sent by
+/// the client and can't be trusted. Unset, the left-most entry is used: spoofable, but it never
+/// lumps every visitor into one bucket if the hop count were wrong. Check a production request
+/// log and set it (the global caps bound load either way).
+fn trusted_proxy_hops() -> Option<usize> {
+    static HOPS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *HOPS.get_or_init(|| {
+        std::env::var("TRUSTED_PROXY_HOPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
 fn client_ip(request: &Request) -> String {
-    // Behind Firebase Hosting / Cloud Run the client address arrives in X-Forwarded-For. It can
-    // be spoofed, so it only guards anonymous endpoints; signed-in traffic is keyed by session.
-    request
+    let forwarded: Vec<String> = request
         .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
         .map(|ip| ip.trim().to_string())
-        .or_else(|| {
-            request
-                .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|c| c.0.ip().to_string())
-        })
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    let picked = match trusted_proxy_hops() {
+        Some(hops) if forwarded.len() > hops => forwarded.get(forwarded.len() - 1 - hops),
+        Some(_) => None,
+        None => forwarded.first(),
+    };
+    if let Some(ip) = picked {
+        return ip.clone();
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn session_cookie(request: &Request) -> Option<String> {
-    let cookies = request.headers().get(header::COOKIE)?.to_str().ok()?;
-    cookies
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .find(|(name, _)| *name == SESSION_COOKIE_NAME)
-        .map(|(_, value)| value.to_string())
+/// The session token, only if the cookie decrypts with our key: a made-up cookie must not buy
+/// its own rate-limit bucket.
+fn session_cookie(request: &Request, key: &axum_extra::extract::cookie::Key) -> Option<String> {
+    axum_extra::extract::PrivateCookieJar::from_headers(request.headers(), key.clone())
+        .get(SESSION_COOKIE_NAME)
+        .map(|c| c.value().to_string())
+}
+
+fn looks_like_screen_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let ip = client_ip(&request);
-    let session = session_cookie(&request);
+    let session = session_cookie(&request, &state.cookie_key);
 
     // A paired TV screen carries its token in the path: limit it like a signed-in user.
     let screen_token = path
         .strip_prefix("/api/screen/")
         .and_then(|rest| rest.split('/').next())
-        .filter(|token| *token != "pair" && !token.is_empty());
+        .filter(|token| looks_like_screen_token(token));
 
-    let mut checks: Vec<(String, u32)> = Vec::with_capacity(2);
+    let mut checks: Vec<(String, u32)> = Vec::with_capacity(4);
     match (&session, screen_token) {
-        (_, Some(token)) => checks.push((
-            format!("screen:{}", crate::auth::hash_token(token)),
+        (_, Some(token)) => {
+            checks.push((
+                format!("screen:{}", crate::auth::hash_token(token)),
+                SIGNED_IN_PER_MINUTE,
+            ));
+            checks.push(("all:screens".into(), ALL_SCREENS_PER_MINUTE));
+        }
+        (Some(token), None) => checks.push((
+            format!("s:{}", crate::auth::hash_token(token)),
             SIGNED_IN_PER_MINUTE,
         )),
-        (Some(cookie), None) => checks.push((
-            format!("s:{}", crate::auth::hash_token(cookie)),
-            SIGNED_IN_PER_MINUTE,
-        )),
-        (None, None) => checks.push((format!("ip:{ip}"), ANONYMOUS_PER_MINUTE)),
+        (None, None) => {
+            checks.push((format!("ip:{ip}"), ANONYMOUS_PER_MINUTE));
+            checks.push(("all:anonymous".into(), ALL_ANONYMOUS_PER_MINUTE));
+        }
     }
     if path.ends_with("/auth/session")
         || path.ends_with("/auth/dev-login")
         || path == "/api/screen/pair"
     {
         checks.push((format!("signin:{ip}"), SIGN_IN_PER_MINUTE));
+        checks.push(("all:signin".into(), ALL_SIGN_IN_PER_MINUTE));
     }
     if path.ends_with("/campaigns/join") {
         let who = session
@@ -241,6 +281,8 @@ pub async fn rate_limit(State(state): State<AppState>, request: Request, next: N
             .map(crate::auth::hash_token)
             .unwrap_or(ip.clone());
         checks.push((format!("join:{who}"), JOIN_PER_MINUTE));
+        checks.push((format!("join-ip:{ip}"), JOIN_PER_MINUTE * 3));
+        checks.push(("all:join".into(), ALL_JOIN_PER_MINUTE));
     }
 
     for (key, limit) in checks {

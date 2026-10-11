@@ -22,6 +22,9 @@ const TOUCH_EVERY_SECS: i64 = 3600;
 
 pub const USER_COLUMNS: &str = "id, email, firebase_uid, created_at, updated_at";
 
+/// Devices a user can be signed in on at once.
+pub const MAX_SESSIONS_PER_USER: i64 = 20;
+
 pub fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -51,11 +54,22 @@ pub async fn start_session(
     .bind(now + SESSION_IDLE_SECS)
     .execute(pool)
     .await?;
-    // Opportunistic cleanup of expired sessions.
+    // Opportunistic cleanup of expired sessions, and at most MAX_SESSIONS_PER_USER per account
+    // (oldest first) so one sign-in token can't mint unlimited sessions.
     sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
         .bind(now)
         .execute(pool)
         .await?;
+    sqlx::query(
+        "DELETE FROM sessions WHERE user_id = ? AND id_hash NOT IN (
+             SELECT id_hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+         )",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(MAX_SESSIONS_PER_USER)
+    .execute(pool)
+    .await?;
 
     let mut cookie = Cookie::new(SESSION_COOKIE_NAME, token);
     cookie.set_secure(secure);

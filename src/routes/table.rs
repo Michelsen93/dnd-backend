@@ -272,7 +272,8 @@ async fn actor_name(state: &AppState, access: &CampaignAccess, user: &UserRow) -
         }
     }
     if names.is_empty() {
-        user.email.clone()
+        // Never fall back to the email address: everyone at the table (and the TV) sees this.
+        "A player".to_string()
     } else {
         names.join(" / ")
     }
@@ -448,6 +449,10 @@ async fn roll(
         Some(target) => Some(resolve_target(&state, &id, target, access.is_dm()).await?),
         None => None,
     };
+    // A flat number (no d20) aimed at a target would just probe its AC.
+    if target.is_some() && roll_kind == "attack" && result.natural.is_none() {
+        return Err(ApiError::bad_request("Attack rolls need a d20"));
+    }
     let outcome = match (&target, roll_kind.as_str()) {
         (Some(target), "attack") => Some(attack_outcome(&result, target.armor_class)),
         _ => None,
@@ -1074,6 +1079,15 @@ impl Ctx<'_> {
         if x < 0 || y < 0 || x >= encounter.grid_cols || y >= encounter.grid_rows {
             return Err(ApiError::bad_request("That square is off the map"));
         }
+        // Players only step onto squares their party can see, so the answers below (wall,
+        // occupied) never reveal what's hidden in the fog.
+        if !self.access.is_dm()
+            && !projection::is_visible(&projection::player_visibility(&encounter), x, y)
+        {
+            return Err(ApiError::bad_request(
+                "You can only move to squares your party can see",
+            ));
+        }
         if encounter
             .terrain
             .get(y as usize)
@@ -1285,7 +1299,8 @@ impl Ctx<'_> {
         let mut names = Vec::new();
         for character_id in character_ids.iter().filter(|id| members.contains(id)) {
             let mut record = repo::load_character(&self.state.pool, character_id).await?;
-            let xp = repo::json_i64(&record.value, "experiencePoints") + amount as i64;
+            let xp = (repo::json_i64(&record.value, "experiencePoints") + amount as i64)
+                .clamp(0, 10_000_000);
             record.value["experiencePoints"] = json!(xp);
             names.push(
                 record

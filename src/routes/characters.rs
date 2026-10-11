@@ -27,10 +27,17 @@ pub async fn list(
     .fetch_all(&state.pool)
     .await?;
 
+    // One damaged sheet must not hide all the others.
     let characters = rows
         .iter()
-        .map(character_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|row| match character_from_row(row) {
+            Ok(character) => Some(character),
+            Err(_) => {
+                tracing::warn!("skipping a character that no longer loads");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(characters))
 }
@@ -134,6 +141,16 @@ pub async fn delete_character(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
+    let owned: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM characters WHERE id = ? AND user_id = ?")
+            .bind(&id)
+            .bind(&user.id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if owned.is_none() {
+        return Err(ApiError::not_found("Character not found"));
+    }
+    // Tell its campaigns before the delete removes the memberships.
     crate::repo::notify_character_campaigns(&state, &id).await?;
     let result = sqlx::query("DELETE FROM characters WHERE id = ? AND user_id = ?")
         .bind(&id)
