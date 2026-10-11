@@ -83,9 +83,10 @@ pub async fn save_encounter(pool: &SqlitePool, encounter: &mut Encounter) -> Res
     if encounter.created_at.is_empty() {
         encounter.created_at = now.clone();
     }
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO encounters (id, campaign_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+         ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+         WHERE encounters.campaign_id = excluded.campaign_id",
     )
     .bind(&encounter.id)
     .bind(&encounter.campaign_id)
@@ -94,6 +95,10 @@ pub async fn save_encounter(pool: &SqlitePool, encounter: &mut Encounter) -> Res
     .bind(&now)
     .execute(pool)
     .await?;
+    // An id that belongs to another campaign is never overwritten.
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("Encounter not found"));
+    }
     Ok(())
 }
 
@@ -242,6 +247,7 @@ pub async fn record_event(
     visibility: &str,
     payload: Value,
 ) -> Result<EventRecord, ApiError> {
+    crate::limits::ensure_size(&payload, crate::limits::MAX_EVENT_BYTES, "Feed entry")?;
     let session_id = load_table_state(&state.pool, campaign_id).await?.session_id;
     let record = EventRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -321,14 +327,17 @@ pub async fn visible_events(
         .collect())
 }
 
-/// Roll requests can carry a hidden DC; players only see it if the DM made it public.
+/// DM-only parts of otherwise public events: a hidden DC on a roll request, and `dmDetail`
+/// (e.g. a monster's exact HP after damage).
 fn strip_secret_fields(payload: &mut Value) {
-    if let Value::Object(map) = payload
-        && map
+    if let Value::Object(map) = payload {
+        map.remove("dmDetail");
+        if map
             .get("hiddenDc")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-    {
-        map.remove("dc");
+        {
+            map.remove("dc");
+        }
     }
 }

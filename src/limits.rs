@@ -18,22 +18,33 @@ use crate::{auth::SESSION_COOKIE_NAME, error::ApiError, state::AppState};
 pub const MAX_CHARACTERS_PER_USER: i64 = 30;
 pub const MAX_CAMPAIGNS_OWNED: i64 = 10;
 pub const MAX_MEMBERS_PER_CAMPAIGN: i64 = 12;
-pub const MAX_ENCOUNTERS_PER_CAMPAIGN: i64 = 50;
+pub const MAX_ENCOUNTERS_PER_CAMPAIGN: i64 = 30;
 pub const MAX_ENTITIES_PER_CAMPAIGN: i64 = 300;
 pub const MAX_NOTES_PER_CHARACTER: i64 = 300;
+/// Notes across all of a user's characters (keeps one account's storage bounded).
+pub const MAX_NOTES_PER_USER: i64 = 600;
 /// Older feed events are pruned beyond this (session logs are kept separately).
-pub const MAX_EVENTS_PER_CAMPAIGN: i64 = 5000;
+pub const MAX_EVENTS_PER_CAMPAIGN: i64 = 3000;
+/// Any single feed event (a roll with 200 dice is ~2 KB).
+pub const MAX_EVENT_BYTES: usize = 8 * 1024;
+/// SQLite refuses writes past this size instead of letting the server run out of memory (Cloud
+/// Run keeps the database on its in-memory filesystem).
+pub const MAX_DATABASE_BYTES: u64 = 384 * 1024 * 1024;
 
 // ── Sizes ─────────────────────────────────────────────────────────────────────
 
 /// Whole request bodies. A 40×40 map is ~30 KB; a full character sheet is a few KB.
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
+/// A full 40×40 map with tokens and notes is about 40 KB.
+pub const MAX_ENCOUNTER_BYTES: usize = 96 * 1024;
 pub const MAX_CHARACTER_BYTES: usize = 64 * 1024;
 pub const MAX_ENTITY_BYTES: usize = 16 * 1024;
 pub const MAX_NOTE_BYTES: usize = 20 * 1024;
 pub const MAX_SESSION_LOG_BYTES: usize = 20 * 1024;
 pub const MAX_NAME_CHARS: usize = 80;
 pub const MAX_LABEL_CHARS: usize = 120;
+/// Ids, kinds and other short machine strings sent by clients.
+pub const MAX_ID_CHARS: usize = 64;
 pub const MAX_FEED_TEXT_CHARS: usize = 500;
 pub const MAX_SPOTLIGHT_BODY_CHARS: usize = 2000;
 
@@ -59,6 +70,18 @@ pub fn ensure_chars(text: &str, max: usize, what: &str) -> Result<(), ApiError> 
     Ok(())
 }
 
+/// Sprite keys, condition ids and the like: short, lowercase, `a-z0-9_-` only (empty allowed).
+pub fn ensure_key(value: &str, what: &str) -> Result<(), ApiError> {
+    if value.len() > 40
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(ApiError::bad_request(format!("{what} is not a valid key")));
+    }
+    Ok(())
+}
+
 pub fn ensure_quota(current: i64, max: i64, what: &str) -> Result<(), ApiError> {
     if current >= max {
         return Err(ApiError::bad_request(format!(
@@ -66,6 +89,58 @@ pub fn ensure_quota(current: i64, max: i64, what: &str) -> Result<(), ApiError> 
         )));
     }
     Ok(())
+}
+
+// ── Open streams ──────────────────────────────────────────────────────────────
+
+/// Live streams (SSE) each hold a request slot for as long as they are open, so they are
+/// counted per holder (a user or a TV screen) and in total, not per minute.
+pub const MAX_STREAMS_PER_HOLDER: usize = 6;
+pub const MAX_STREAMS_TOTAL: usize = 400;
+
+#[derive(Default)]
+pub struct StreamCounter {
+    open: Mutex<HashMap<String, usize>>,
+}
+
+/// One open stream; dropping it (the client disconnected) frees the slot.
+pub struct StreamSlot {
+    counter: std::sync::Arc<StreamCounter>,
+    holder: String,
+}
+
+impl StreamCounter {
+    pub fn acquire(
+        counter: &std::sync::Arc<StreamCounter>,
+        holder: &str,
+    ) -> Result<StreamSlot, ApiError> {
+        let mut open = counter.open.lock().expect("stream counter lock");
+        let total: usize = open.values().sum();
+        let mine = open.get(holder).copied().unwrap_or(0);
+        if total >= MAX_STREAMS_TOTAL || mine >= MAX_STREAMS_PER_HOLDER {
+            return Err(ApiError::too_many(
+                "Too many live connections open — close some tabs and try again",
+            ));
+        }
+        *open.entry(holder.to_string()).or_insert(0) += 1;
+        Ok(StreamSlot {
+            counter: counter.clone(),
+            holder: holder.to_string(),
+        })
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        if let Ok(mut open) = self.counter.open.lock()
+            && let Some(count) = open.get_mut(&self.holder)
+        {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.holder);
+            }
+        }
+    }
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -196,6 +271,18 @@ mod tests {
         }
         assert!(limiter.hit("a", 3, 60).is_err());
         assert!(limiter.hit("b", 3, 60).is_ok());
+    }
+
+    #[test]
+    fn streams_are_counted_while_open() {
+        let counter = std::sync::Arc::new(StreamCounter::default());
+        let slots: Vec<_> = (0..MAX_STREAMS_PER_HOLDER)
+            .map(|_| StreamCounter::acquire(&counter, "u:1").unwrap())
+            .collect();
+        assert!(StreamCounter::acquire(&counter, "u:1").is_err());
+        assert!(StreamCounter::acquire(&counter, "u:2").is_ok());
+        drop(slots);
+        assert!(StreamCounter::acquire(&counter, "u:1").is_ok());
     }
 
     #[test]

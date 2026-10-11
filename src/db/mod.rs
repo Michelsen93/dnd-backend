@@ -28,7 +28,12 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        // Hard ceiling (4 KiB pages): writes fail with "database full" before memory runs out.
+        .pragma(
+            "max_page_count",
+            (crate::limits::MAX_DATABASE_BYTES / 4096).to_string(),
+        );
 
     // Every `:memory:` connection is its own database, so in-memory pools must be single-connection.
     let max_connections = if database_url.contains(":memory:") {

@@ -5,7 +5,11 @@ use axum_extra::extract::cookie::Key;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
-use crate::{config::AppConfig, firebase::FirebaseVerifier, limits::RateLimiter};
+use crate::{
+    config::AppConfig,
+    firebase::FirebaseVerifier,
+    limits::{RateLimiter, StreamCounter},
+};
 
 /// Something changed in a campaign; SSE subscribers of that campaign refetch.
 #[derive(Clone, Debug)]
@@ -23,6 +27,7 @@ pub struct AppState {
     /// Present when FIREBASE_PROJECT_ID is configured.
     pub firebase: Option<Arc<FirebaseVerifier>>,
     pub limiter: Arc<RateLimiter>,
+    pub streams: Arc<StreamCounter>,
 }
 
 impl AppState {
@@ -39,6 +44,7 @@ impl AppState {
             campaign_tx,
             firebase,
             limiter: Arc::new(RateLimiter::default()),
+            streams: Arc::new(StreamCounter::default()),
         }
     }
 

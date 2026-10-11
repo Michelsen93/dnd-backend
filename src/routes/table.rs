@@ -147,13 +147,15 @@ async fn stream(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let user = require_user(&state.pool, &jar).await?;
     campaign_access(&state.pool, &id, &user.id).await?;
-    Ok(campaign_stream(&state, id))
+    let slot = limits::StreamCounter::acquire(&state.streams, &format!("u:{}", user.id))?;
+    Ok(campaign_stream(&state, id, slot))
 }
 
 /// SSE for one campaign: `update` events plus pings. Shared by members and paired screens.
 pub fn campaign_stream(
     state: &AppState,
     id: String,
+    slot: limits::StreamSlot,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + use<>> {
     let rx = state.campaign_tx.subscribe();
 
@@ -177,7 +179,11 @@ pub fn campaign_stream(
         tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(10)))
             .map(|_| Ok(Event::default().event("ping").data("ping")));
 
-    Sse::new(hello.chain(updates.merge(pings)))
+    // The slot lives as long as the stream: when the client goes away, it's freed.
+    Sse::new(hello.chain(updates.merge(pings)).map(move |event| {
+        let _held = &slot;
+        event
+    }))
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -377,6 +383,17 @@ pub fn attack_outcome(result: &dice::RollResult, armor_class: i32) -> &'static s
     }
 }
 
+const ROLL_KINDS: &[&str] = &[
+    "check",
+    "save",
+    "attack",
+    "damage",
+    "heal",
+    "initiative",
+    "death_save",
+    "custom",
+];
+
 async fn roll(
     State(state): State<AppState>,
     jar: PrivateCookieJar,
@@ -408,6 +425,17 @@ async fn roll(
     limits::ensure_chars(&input.label, limits::MAX_LABEL_CHARS, "Roll label")?;
     if let Some(meta) = &input.meta {
         limits::ensure_size(meta, 2048, "Roll details")?;
+    }
+    if let Some(kind) = input.roll_kind.as_deref()
+        && !ROLL_KINDS.contains(&kind)
+    {
+        return Err(ApiError::bad_request("Unknown roll kind"));
+    }
+    if !matches!(input.advantage.as_deref(), None | Some("adv") | Some("dis")) {
+        return Err(ApiError::bad_request("advantage must be 'adv' or 'dis'"));
+    }
+    if let Some(request_id) = &input.request_id {
+        limits::ensure_chars(request_id, limits::MAX_ID_CHARS, "Request id")?;
     }
     let advantage = Advantage::parse(input.advantage.as_deref());
     let result = dice::roll(&input.notation, advantage).map_err(ApiError::bad_request)?;
@@ -617,16 +645,46 @@ enum Action {
 
 fn validate_action(action: &Action) -> Result<(), ApiError> {
     match action {
-        Action::Spotlight { title, body, .. } => {
+        Action::Spotlight {
+            title,
+            body,
+            kind,
+            sprite_key,
+        } => {
             limits::ensure_chars(title, limits::MAX_LABEL_CHARS, "Title")?;
-            limits::ensure_chars(body, limits::MAX_SPOTLIGHT_BODY_CHARS, "Text")
+            limits::ensure_chars(body, limits::MAX_SPOTLIGHT_BODY_CHARS, "Text")?;
+            limits::ensure_chars(kind, limits::MAX_ID_CHARS, "Kind")?;
+            limits::ensure_key(sprite_key.as_deref().unwrap_or(""), "Sprite")
+        }
+        Action::ToggleCondition {
+            condition,
+            target_id,
+            target_kind,
+        } => {
+            limits::ensure_chars(condition, limits::MAX_ID_CHARS, "Condition")?;
+            limits::ensure_chars(target_id, limits::MAX_ID_CHARS, "Target")?;
+            limits::ensure_chars(target_kind, limits::MAX_ID_CHARS, "Target kind")
         }
         Action::RequestRoll {
             label,
             character_ids,
+            roll_kind,
+            skill,
+            ability,
             ..
         } => {
             limits::ensure_chars(label, limits::MAX_LABEL_CHARS, "Label")?;
+            limits::ensure_chars(roll_kind, limits::MAX_ID_CHARS, "Roll kind")?;
+            limits::ensure_chars(
+                skill.as_deref().unwrap_or(""),
+                limits::MAX_ID_CHARS,
+                "Skill",
+            )?;
+            limits::ensure_chars(
+                ability.as_deref().unwrap_or(""),
+                limits::MAX_ID_CHARS,
+                "Ability",
+            )?;
             if character_ids.len() > limits::MAX_MEMBERS_PER_CAMPAIGN as usize {
                 return Err(ApiError::bad_request("Too many characters"));
             }
@@ -1279,7 +1337,13 @@ impl Ctx<'_> {
                 "text": format!("Victory! {} defeated · {} XP each", defeated.len(), share),
                 "encounterId": encounter.id,
                 "encounterName": encounter.name,
-                "defeated": defeated.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                // Names only for monsters the party saw; the count includes the rest.
+                "defeated": defeated
+                    .iter()
+                    .filter(|m| monster_event_visibility(&encounter, &m.id) == "public")
+                    .map(|m| m.name.clone())
+                    .collect::<Vec<_>>(),
+                "defeatedCount": defeated.len(),
                 "xpEach": share,
             }),
         )
