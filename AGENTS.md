@@ -53,11 +53,20 @@ session cookie `Secure`) and `FIREBASE_PROJECT_ID`. The server refuses to start 
 ## Abuse limits (`limits.rs`)
 
 The router built by `routes::app(state)` adds a 256 KB body limit and the `rate_limit` middleware
-(in-memory fixed windows: 300 req/min per session, 60/min per IP when signed out, 10/min for
-sign-in, TV pairing and invite-code joins; a TV screen's token counts like a session). Handlers enforce quotas with `ensure_quota` (characters,
-campaigns owned, members, maps, entities, notes; the feed is pruned to 5,000 events) and sizes with
-`ensure_size` / `ensure_chars`. New create endpoints need a quota, new free-text fields a cap.
-Database errors are logged and returned as a generic 500.
+(in-memory fixed windows: 300 req/min per session — only for cookies that decrypt — 60/min per IP
+when signed out, 10/min for sign-in, TV pairing and invite-code joins, a TV screen's token like a
+session, and global caps behind the per-IP ones). The client IP comes from `X-Forwarded-For`,
+`TRUSTED_PROXY_HOPS` entries from the right when set. Live streams are counted while open
+(`StreamCounter`: 6 per user or screen, 400 total).
+
+Everything a client sends is bounded before it's stored: quotas with `ensure_quota` (characters,
+campaigns owned, members, maps, entities, notes per character and per user), sizes with
+`ensure_size` / `ensure_chars` / `ensure_key` (sprite keys), dice notation (64 chars, 10 parts, 200
+dice), every feed event ≤ 8 KB (`record_event`), maps ≤ 96 KB with tokens on the grid and vision
+≤ 40, and SQLite's `max_page_count` caps the file at 384 MB (Cloud Run keeps it in memory). Every
+character write goes through `save_character_value`, which refuses a value that no longer loads
+as a `Character`. **New create endpoints need a quota, new client strings a cap, new stored
+payloads a size check.** Database and parse errors are logged and returned generically.
 
 ## Deployment (Cloud Run behind Firebase Hosting)
 
@@ -116,7 +125,7 @@ src/
     table.rs         /{id}/table (snapshot), /stream (SSE), /events, /rolls (targets → hit/miss), /actions
     screen.rs        TV screens: DM /{id}/screens (pairing codes); /api/screen/{pair, {token}/table, {token}/stream}
 migrations/          000N_name.sql, applied by sqlx::migrate! at startup and in tests
-Dockerfile           production image (server + Litestream); docker-entrypoint.sh restores/replicates
+Dockerfile           production image (server + Litestream, runs as uid 10001); docker-entrypoint.sh restores/replicates
 tests/               common/ helpers + end-to-end tests through the real router
 ```
 
@@ -148,6 +157,10 @@ tests/               common/ helpers + end-to-end tests through the real router
 
 ## Testing
 
+`tests/security_integration.rs` holds one regression test per security-review finding (huge rolls,
+map id takeover, off-grid tokens, HP in the feed, stream caps, invite codes, sheet integrity, fog
+probing, loot races, forged cookies, session caps). Add to it when you fix something similar.
+
 Use `tests/common/mod.rs`: `test_app()` gives an in-memory app (dev sign-in mode),
 `test_app_with(|state| …)` customizes state (e.g. a `FirebaseVerifier::with_static_keys` for token
 tests; `auth_integration.rs` generates an RSA key at runtime, never commit one),
@@ -163,9 +176,13 @@ memory connection is its own database.
 
 ## Known issues / tech debt
 
-- `COOKIE_SECRET` is padded/truncated to 64 bytes; the default secret is for dev only.
+- The cookie key is SHA-512 of `COOKIE_SECRET`; production (COOKIE_SECURE or Cloud Run's
+  `K_SERVICE`) requires 32+ characters and refuses to start without Firebase. The default secret
+  is for dev only. Changing the secret signs everyone out.
 - Rate limits are in memory, so they reset on restart (fine for a single instance). The client IP
   comes from `X-Forwarded-For`, which only guards anonymous endpoints.
+- Players can set their own `speed` and roll any notation they like (integrity, not secrecy: the
+  server checks hidden information, not honesty at the table).
 - TV screen tokens travel in the URL path (EventSource can't send headers), so they appear in
   request logs. They are read-only, revocable by the DM and expire after 30 idle days.
 - SSE uses one broadcast channel for all campaigns, filtered per subscriber — fine at table scale.
