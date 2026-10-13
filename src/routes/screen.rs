@@ -318,5 +318,9 @@ async fn screen_stream(
     Path(token): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let id = screen_campaign(&state, &token).await?;
-    Ok(campaign_stream(&state, id))
+    let slot = crate::limits::StreamCounter::acquire(
+        &state.streams,
+        &format!("screen:{}", hash_token(&token)),
+    )?;
+    Ok(campaign_stream(&state, id, slot))
 }

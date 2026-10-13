@@ -68,6 +68,11 @@ pub struct RollResult {
 
 const MAX_DICE: u32 = 100;
 const MAX_SIDES: u32 = 1000;
+/// Whole-roll limits: results are stored in the feed, so a roll must stay small.
+const MAX_NOTATION_CHARS: usize = 64;
+const MAX_TERMS: usize = 10;
+const MAX_TOTAL_DICE: u32 = 200;
+const MAX_CONSTANT: i32 = 10_000;
 
 fn parse(notation: &str) -> Result<Vec<Term>, String> {
     let compact: String = notation
@@ -77,6 +82,11 @@ fn parse(notation: &str) -> Result<Vec<Term>, String> {
         .to_lowercase();
     if compact.is_empty() {
         return Err("Empty dice notation".into());
+    }
+    if compact.len() > MAX_NOTATION_CHARS {
+        return Err(format!(
+            "Dice notation is too long ({MAX_NOTATION_CHARS} characters max)"
+        ));
     }
     let mut terms = Vec::new();
     let mut sign = 1;
@@ -106,12 +116,24 @@ fn parse(notation: &str) -> Result<Vec<Term>, String> {
         }
     }
     flush(&mut current, sign, &mut terms)?;
+    let dice: u32 = terms
+        .iter()
+        .map(|t| match t {
+            Term::Dice { count, .. } => *count,
+            Term::Constant(_) => 0,
+        })
+        .sum();
+    if terms.len() > MAX_TERMS || dice > MAX_TOTAL_DICE {
+        return Err(format!(
+            "Too many dice: at most {MAX_TOTAL_DICE} dice in {MAX_TERMS} parts"
+        ));
+    }
     Ok(terms)
 }
 
 fn parse_term(raw: &str, sign: i32) -> Option<Term> {
     if let Ok(value) = raw.parse::<i32>() {
-        return Some(Term::Constant(sign * value));
+        return (value.abs() <= MAX_CONSTANT).then_some(Term::Constant(sign * value));
     }
     let (count_raw, rest) = raw.split_once('d')?;
     let count = if count_raw.is_empty() {
@@ -289,5 +311,19 @@ mod tests {
         assert!(validate("2d6+").is_err());
         assert!(validate("3d6kh4").is_err());
         assert!(validate("-1d4+2").is_ok());
+    }
+
+    #[test]
+    fn rejects_rolls_too_big_to_store() {
+        assert!(validate(&"100d1000+".repeat(3)).is_err(), "too long");
+        assert!(validate("100d6+100d6+1d6").is_err(), "more than 200 dice");
+        assert!(
+            validate("1+1+1+1+1+1+1+1+1+1+1").is_err(),
+            "more than 10 parts"
+        );
+        assert!(validate("99999").is_err(), "huge constant");
+        assert!(validate("2147483647+2147483647").is_err(), "no overflow");
+        assert!(validate("100d6+100d6").is_ok());
+        assert!(validate("8d6+5").is_ok());
     }
 }

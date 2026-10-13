@@ -18,12 +18,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::from_env();
-    if config.cookie_secure && std::env::var("COOKIE_SECRET").is_err() {
-        return Err("COOKIE_SECRET must be set in production (COOKIE_SECURE=true)".into());
+    // Cloud Run always sets K_SERVICE: treat it as production even if COOKIE_SECURE is missing.
+    let production = config.cookie_secure || std::env::var("K_SERVICE").is_ok();
+    if production && std::env::var("COOKIE_SECRET").map_or(true, |s| s.len() < 32) {
+        return Err("COOKIE_SECRET (32+ characters) must be set in production".into());
     }
-    if config.cookie_secure && config.firebase_project_id.is_none() {
+    if production && config.firebase_project_id.is_none() {
         // Without Firebase the passwordless dev login would be open to the internet.
-        return Err("FIREBASE_PROJECT_ID must be set in production (COOKIE_SECURE=true)".into());
+        return Err("FIREBASE_PROJECT_ID must be set in production".into());
     }
     let pool = db::connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -87,10 +89,9 @@ async fn shutdown_signal() {
     }
 }
 
+/// The 64-byte cookie key is the SHA-512 of the secret, so any length works and no part of the
+/// key is ever zero padding.
 fn cookie_key_from_secret(secret: &str) -> Key {
-    let mut bytes = [0_u8; 64];
-    for (index, value) in secret.as_bytes().iter().enumerate().take(64) {
-        bytes[index] = *value;
-    }
-    Key::from(&bytes)
+    use sha2::{Digest, Sha512};
+    Key::from(&Sha512::digest(secret.as_bytes()))
 }

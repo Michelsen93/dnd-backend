@@ -166,10 +166,11 @@ async fn the_feed_is_pruned_to_a_bounded_size() {
         .await;
     let id = campaign["id"].as_str().unwrap();
     sqlx::query(
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
          INSERT INTO campaign_events (id, campaign_id, kind, visibility, payload, created_at)
          SELECT 'old-' || i, ?, 'note', 'public', '{}', '' FROM n",
     )
+    .bind(backend::limits::MAX_EVENTS_PER_CAMPAIGN)
     .bind(id)
     .execute(&app.pool)
     .await
@@ -187,7 +188,7 @@ async fn the_feed_is_pruned_to_a_bounded_size() {
             .fetch_one(&app.pool)
             .await
             .unwrap();
-    assert_eq!(count, 5000);
+    assert_eq!(count, backend::limits::MAX_EVENTS_PER_CAMPAIGN);
     let oldest_gone: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM campaign_events WHERE id = 'old-1'")
             .fetch_one(&app.pool)

@@ -43,6 +43,9 @@ fn terrain_at(encounter: &Encounter, x: i32, y: i32) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Largest vision radius in cells (the grid is at most 40 wide).
+pub const MAX_VISION_RADIUS: i32 = 40;
+
 /// Cells players can see: DM-revealed cells plus everything in a token's vision radius
 /// (blocked by walls when enabled). Mirrors `features/encounter/visibility.ts`.
 pub fn player_visibility(encounter: &Encounter) -> Vec<Vec<bool>> {
@@ -58,9 +61,17 @@ pub fn player_visibility(encounter: &Encounter) -> Vec<Vec<bool>> {
                         .unwrap_or(false);
                     revealed
                         || encounter.player_tokens.iter().any(|token| {
-                            let dx = token.x - col;
-                            let dy = token.y - row;
-                            if dx * dx + dy * dy > token.vision_radius * token.vision_radius {
+                            // Defense in depth (validate() already enforces this): tokens off the
+                            // grid see nothing, and the line-of-sight walk stays short.
+                            if !(0..encounter.grid_cols).contains(&token.x)
+                                || !(0..encounter.grid_rows).contains(&token.y)
+                            {
+                                return false;
+                            }
+                            let radius = i64::from(token.vision_radius.clamp(0, MAX_VISION_RADIUS));
+                            let dx = i64::from(token.x - col);
+                            let dy = i64::from(token.y - row);
+                            if dx * dx + dy * dy > radius * radius {
                                 return false;
                             }
                             !encounter.los_block_by_walls

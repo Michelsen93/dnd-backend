@@ -61,6 +61,19 @@ fn validate(encounter: &Encounter) -> Result<(), ApiError> {
             "terrain and visibility must match the grid size",
         ));
     }
+    let on_grid = |x: i32, y: i32| {
+        (0..encounter.grid_cols).contains(&x) && (0..encounter.grid_rows).contains(&y)
+    };
+    let monsters_ok = encounter.monsters.iter().all(|m| on_grid(m.x, m.y));
+    let tokens_ok = encounter.player_tokens.iter().all(|t| {
+        on_grid(t.x, t.y) && (0..=crate::projection::MAX_VISION_RADIUS).contains(&t.vision_radius)
+    });
+    if !monsters_ok || !tokens_ok {
+        return Err(ApiError::bad_request(
+            "Tokens must be on the map, with a vision radius of 0–40",
+        ));
+    }
+    crate::limits::ensure_size(encounter, crate::limits::MAX_ENCOUNTER_BYTES, "Map")?;
     Ok(())
 }
 
@@ -84,9 +97,8 @@ async fn create(
         crate::limits::MAX_ENCOUNTERS_PER_CAMPAIGN,
         "maps per campaign",
     )?;
-    if encounter.id.trim().is_empty() {
-        encounter.id = uuid::Uuid::new_v4().to_string();
-    }
+    // Never trust a client-chosen id: it could name another campaign's map.
+    encounter.id = uuid::Uuid::new_v4().to_string();
     encounter.campaign_id = id.clone();
     encounter.revision = 0;
     encounter.created_at = String::new();

@@ -16,7 +16,9 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /usr/local/bin/litestream /usr/local/bin/litestream
 COPY --from=build /src/target/release/backend /app/backend
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /data
+RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /data && chown 10001:10001 /data
+# Run unprivileged: the server and Litestream only need /data.
+USER 10001:10001
 
 ENV APP_HOST=0.0.0.0 \
     PORT=8080 \

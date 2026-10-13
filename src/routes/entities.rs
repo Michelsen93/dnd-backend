@@ -317,7 +317,7 @@ async fn claim(
         .get("quantity")
         .and_then(Value::as_i64)
         .unwrap_or(1)
-        .max(1);
+        .clamp(1, 9_999);
     let item = json!({
         "id": format!("item-{}", uuid::Uuid::new_v4()),
         "name": name,
@@ -334,8 +334,27 @@ async fn claim(
         Some(inventory) => inventory.push(item),
         None => character.value["inventory"] = json!([item]),
     }
-    repo::save_character_value(&state, &input.character_id, &mut character.value).await?;
-
+    // Claim atomically: only one request can flip the row from loot to claimed, so two
+    // simultaneous claims can't both get the item.
+    let locked = sqlx::query(
+        "UPDATE campaign_entities SET kind = 'claimed' WHERE id = ? AND campaign_id = ? AND kind = 'loot'",
+    )
+    .bind(&entity_id)
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+    if locked.rows_affected() == 0 {
+        return Err(ApiError::conflict("Someone already took that"));
+    }
+    if let Err(err) =
+        repo::save_character_value(&state, &input.character_id, &mut character.value).await
+    {
+        sqlx::query("UPDATE campaign_entities SET kind = 'loot' WHERE id = ?")
+            .bind(&entity_id)
+            .execute(&state.pool)
+            .await?;
+        return Err(err);
+    }
     sqlx::query("DELETE FROM campaign_entities WHERE id = ?")
         .bind(&entity_id)
         .execute(&state.pool)

@@ -55,6 +55,15 @@ pub async fn create_for_character(
         limits::MAX_NOTES_PER_CHARACTER,
         "journal entries per character",
     )?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes WHERE user_id = ?")
+        .bind(&user.id)
+        .fetch_one(&state.pool)
+        .await?;
+    limits::ensure_quota(
+        total,
+        limits::MAX_NOTES_PER_USER,
+        "journal entries in total",
+    )?;
 
     let note = input.into_note(character_id.clone());
     limits::ensure_size(&note, limits::MAX_NOTE_BYTES, "Journal entry")?;

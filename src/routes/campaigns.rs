@@ -493,12 +493,13 @@ async fn touch_campaign(state: &AppState, campaign_id: &str) -> Result<(), ApiEr
     Ok(())
 }
 
+/// 12 characters from 32 unambiguous letters and digits (~60 bits): not guessable, even at the
+/// join rate limit.
 fn new_invite_code() -> String {
-    uuid::Uuid::new_v4()
-        .to_string()
-        .replace('-', "")
-        .chars()
-        .take(8)
-        .collect::<String>()
-        .to_uppercase()
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
 }

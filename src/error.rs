@@ -40,6 +40,10 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, message)
     }
 
+    pub fn too_many(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
@@ -70,6 +74,8 @@ impl From<sqlx::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
-        Self::bad_request(error.to_string())
+        // The parser's message can quote internals (field names, stored data); keep it in logs.
+        tracing::info!(%error, "rejected malformed data");
+        Self::bad_request("That data isn't in the expected shape")
     }
 }
